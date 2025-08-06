@@ -75,15 +75,43 @@
   </style>
 </head>
 <body>
-  <form class="login-box" method="POST" action="/authorize">
+  <form class="login-box" id="loginForm">
     <h2>Welcome to Work2gether</h2>
     <p>Please log in to start your session</p>
-    <input type="email" name="email" placeholder="Your Email" required />
+    <input type="email" id="email" name="email" placeholder="Your Email" required />
     <input type="submit" value="Start Session" />
     <div class="message">
       Your time of access will determine how credits are used.<br />
       Make sure to log out if you're done.
     </div>
   </form>
+
+  <script>
+    // Helper to get URL query params
+    function getQueryParam(param) {
+      const urlParams = new URLSearchParams(window.location.search);
+      return urlParams.get(param);
+    }
+
+    document.getElementById('loginForm').addEventListener('submit', function(e) {
+      e.preventDefault();
+
+      const email = document.getElementById('email').value.trim();
+      if (!email) {
+        alert('Please enter your email.');
+        return;
+      }
+
+      // Here you could send email to your backend or Nexudus API if you add one
+
+      // Redirect to the captive portal redirect URL or fallback to google.com
+      const redirectUrl = getQueryParam('redirectUrl') || 'https://www.google.com';
+
+      // Append email as query param optionally, e.g. redirectUrl?email=xxx
+      // But usually the captive portal expects a simple redirect
+
+      window.location.href = redirectUrl;
+    });
+  </script>
 </body>
 </html>
