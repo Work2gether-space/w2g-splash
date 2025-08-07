@@ -75,10 +75,20 @@
   </style>
 </head>
 <body>
-  <form class="login-box" id="loginForm">
+  <!-- Post straight to the helper so we avoid browser CORS issues -->
+  <form class="login-box" id="loginForm"
+        method="post"
+        action="https://YOUR_REPL_URL/submit_email">
     <h2>Welcome to Work2gether</h2>
     <p>Please log in to start your session</p>
+
+    <!-- what the user types -->
     <input type="email" id="email" name="email" placeholder="Your Email" required />
+
+    <!-- wired in for the helper -->
+    <input type="hidden" name="client_id" id="client_id">
+    <input type="hidden" name="next" id="next">
+
     <input type="submit" value="Start Session" />
     <div class="message">
       Your time of access will determine how credits are used.<br />
@@ -87,31 +97,14 @@
   </form>
 
   <script>
-    // Helper to get URL query params
-    function getQueryParam(param) {
-      const urlParams = new URLSearchParams(window.location.search);
-      return urlParams.get(param);
-    }
+    // read portal query
+    const q = new URLSearchParams(window.location.search);
+    const client =
+      q.get('clientMac') || q.get('mac') || q.get('clientIp') || q.get('uip') || '';
 
-    document.getElementById('loginForm').addEventListener('submit', function(e) {
-      e.preventDefault();
-
-      const email = document.getElementById('email').value.trim();
-      if (!email) {
-        alert('Please enter your email.');
-        return;
-      }
-
-      // Here you could send email to your backend or Nexudus API if you add one
-
-      // Redirect to the captive portal redirect URL or fallback to google.com
-      const redirectUrl = getQueryParam('redirectUrl') || 'https://www.google.com';
-
-      // Append email as query param optionally, e.g. redirectUrl?email=xxx
-      // But usually the captive portal expects a simple redirect
-
-      window.location.href = redirectUrl;
-    });
+    // pass device id and where to go next
+    document.getElementById('client_id').value = client || 'manual-test';
+    document.getElementById('next').value = q.get('redirectUrl') || 'https://www.google.com';
   </script>
 </body>
 </html>
