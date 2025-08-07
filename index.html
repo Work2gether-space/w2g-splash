@@ -45,7 +45,7 @@
       margin-bottom: 1.5rem;
       font-family: 'Montserrat', sans-serif;
     }
-    input[type="submit"] {
+    button[type="submit"] {
       width: 100%;
       padding: 0.75rem 1rem;
       font-size: 1rem;
@@ -58,8 +58,8 @@
       border-radius: 0;
       font-family: 'Montserrat', sans-serif;
     }
-    input[type="submit"]:hover,
-    input[type="submit"]:focus {
+    button[type="submit"]:hover,
+    button[type="submit"]:focus {
       background: transparent;
       border: 1px solid #000;
       color: #000;
@@ -72,36 +72,86 @@
       color: #555;
       line-height: 1.3;
     }
+    .status {
+      margin-top: 1rem;
+      font-size: 0.95rem;
+      min-height: 1.2em;
+    }
   </style>
 </head>
 <body>
-  <!-- Posts to your Replit helper to save email + device ID -->
-  <form class="login-box" id="loginForm"
-        method="post"
-        action="https://905e86aa-8575-4a91-8134-991936b778e6-00-3bab2jzyxizdq.spock.replit.dev/submit_email">
+  <form class="login-box" id="loginForm" autocomplete="on" novalidate>
     <h2>Welcome to Work2gether</h2>
     <p>Please log in to start your session</p>
 
     <input type="email" id="email" name="email" placeholder="Your Email" required />
+    <button type="submit">Start Session</button>
 
-    <!-- helper fields -->
-    <input type="hidden" name="client_id" id="client_id">
-    <input type="hidden" name="next" id="next">
-
-    <input type="submit" value="Start Session" />
     <div class="message">
       Your time of access will determine how credits are used.<br />
       Make sure to log out if you're done.
     </div>
+
+    <div id="status" class="status"></div>
   </form>
 
   <script>
-    const q = new URLSearchParams(window.location.search);
-    const client =
-      q.get('clientMac') || q.get('mac') || q.get('clientIp') || q.get('uip') || '';
-    document.getElementById('client_id').value = client || 'manual-test';
-    document.getElementById('next').value = q.get('redirectUrl') || 'https://www.google.com';
+    // Replit helper endpoint
+    const HELPER_URL = "https://905e86aa-8575-4a91-8134-991936b778e6-00-3bab2jzyxizdq.spock.replit.dev/submit_email";
+
+    // Pull values the portal passed us
+    const q = new URLSearchParams(location.search);
+    const clientId =
+      q.get("clientMac") || q.get("mac") || q.get("clientIp") || q.get("uip") || "manual-test";
+
+    // Use the portal's redirectUrl if present, otherwise use neverssl to avoid HTTPS cert warnings
+    const nextUrl = decodeURIComponent(q.get("redirectUrl") || "") || "http://neverssl.com";
+
+    const form = document.getElementById("loginForm");
+    const statusEl = document.getElementById("status");
+
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      statusEl.textContent = "";
+
+      const email = document.getElementById("email").value.trim();
+      if (!email) {
+        statusEl.textContent = "Enter a valid email.";
+        statusEl.style.color = "red";
+        return;
+      }
+
+      try {
+        // Post to helper as JSON
+        const res = await fetch(HELPER_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email: email, client_id: clientId })
+        });
+
+        if (!res.ok) {
+          const t = await res.text();
+          statusEl.textContent = "Error saving. Try again.";
+          statusEl.style.color = "red";
+          console.error("Helper error:", t);
+          return;
+        }
+
+        // Show saved and bounce to next page
+        statusEl.textContent = "Saved. Finishing sign-in…";
+        statusEl.style.color = "green";
+
+        // Small delay so users see feedback, then redirect
+        setTimeout(() => {
+          location.href = nextUrl;
+        }, 500);
+
+      } catch (err) {
+        statusEl.textContent = "Network error. Try again.";
+        statusEl.style.color = "red";
+        console.error(err);
+      }
+    });
   </script>
 </body>
 </html>
-
