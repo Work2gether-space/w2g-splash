@@ -75,17 +75,16 @@
   </style>
 </head>
 <body>
-  <!-- Post straight to the helper so we avoid browser CORS issues -->
+  <!-- Posts to your Replit helper to save email + device ID -->
   <form class="login-box" id="loginForm"
         method="post"
-        action="https://YOUR_REPL_URL/submit_email">
+        action="https://905e86aa-8575-4a91-8134-991936b778e6-00-3bab2jzyxizdq.spock.replit.dev/submit_email">
     <h2>Welcome to Work2gether</h2>
     <p>Please log in to start your session</p>
 
-    <!-- what the user types -->
     <input type="email" id="email" name="email" placeholder="Your Email" required />
 
-    <!-- wired in for the helper -->
+    <!-- helper fields -->
     <input type="hidden" name="client_id" id="client_id">
     <input type="hidden" name="next" id="next">
 
@@ -97,14 +96,12 @@
   </form>
 
   <script>
-    // read portal query
     const q = new URLSearchParams(window.location.search);
     const client =
       q.get('clientMac') || q.get('mac') || q.get('clientIp') || q.get('uip') || '';
-
-    // pass device id and where to go next
     document.getElementById('client_id').value = client || 'manual-test';
     document.getElementById('next').value = q.get('redirectUrl') || 'https://www.google.com';
   </script>
 </body>
 </html>
+
