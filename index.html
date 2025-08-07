@@ -1,155 +1,101 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
+  <meta charset="UTF-8">
   <title>Work2gether Login</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <link href="https://fonts.googleapis.com/css2?family=Montserrat&display=swap" rel="stylesheet" />
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
     body {
-      margin: 0;
-      font-family: 'Montserrat', sans-serif;
-      background: #fff;
-      color: #000;
+      font-family: sans-serif;
       display: flex;
       justify-content: center;
       align-items: center;
       height: 100vh;
+      background: #fff;
     }
-    .login-box {
-      width: 320px;
-      padding: 2.5rem;
-      border: 1px solid #000;
-      box-sizing: border-box;
-      box-shadow: 0 0 15px rgba(180, 52, 14, 0.3);
-      border-radius: 4px;
+    .card {
+      border: 1px solid #ccc;
+      padding: 2rem;
+      border-radius: 10px;
+      box-shadow: 0 0 15px rgba(0,0,0,0.1);
       text-align: center;
+      max-width: 400px;
+      width: 90%;
     }
-    h2 {
-      color: #B4340E;
-      margin-bottom: 1.5rem;
-      font-weight: 700;
+    .card h1 {
+      color: #b03b1c;
+      margin-bottom: 1rem;
     }
-    p {
-      margin-bottom: 2rem;
-      font-weight: 500;
-      font-size: 1rem;
-    }
-    input[type="email"] {
+    .card input {
       width: 100%;
-      padding: 0.75rem 1rem;
-      font-size: 1rem;
+      padding: 0.75rem;
+      margin-bottom: 1rem;
+      border: 1px solid #aaa;
+      border-radius: 5px;
+    }
+    .card button {
+      padding: 0.75rem 1.5rem;
       border: 1px solid #000;
-      border-radius: 0;
-      box-sizing: border-box;
-      margin-bottom: 1.5rem;
-      font-family: 'Montserrat', sans-serif;
-    }
-    button[type="submit"] {
-      width: 100%;
-      padding: 0.75rem 1rem;
-      font-size: 1rem;
-      font-weight: 700;
-      border: none;
-      background: #000;
-      color: #fff;
+      background: #fff;
       cursor: pointer;
-      transition: all 0.3s ease;
-      border-radius: 0;
-      font-family: 'Montserrat', sans-serif;
+      font-weight: bold;
+      border-radius: 5px;
     }
-    button[type="submit"]:hover,
-    button[type="submit"]:focus {
-      background: transparent;
-      border: 1px solid #000;
-      color: #000;
-      outline: none;
-    }
-    .message {
-      margin-top: 1.5rem;
-      font-size: 0.9rem;
-      font-weight: 500;
-      color: #555;
-      line-height: 1.3;
-    }
-    .status {
+    .card .info {
       margin-top: 1rem;
-      font-size: 0.95rem;
-      min-height: 1.2em;
+      font-size: 0.9rem;
+      color: #555;
+    }
+    .error {
+      color: red;
+      margin-top: 0.75rem;
     }
   </style>
 </head>
 <body>
-  <form class="login-box" id="loginForm" autocomplete="on" novalidate>
-    <h2>Welcome to Work2gether</h2>
+  <div class="card">
+    <h1>Welcome to Work2gether</h1>
     <p>Please log in to start your session</p>
-
-    <input type="email" id="email" name="email" placeholder="Your Email" required />
-    <button type="submit">Start Session</button>
-
-    <div class="message">
-      Your time of access will determine how credits are used.<br />
+    <form id="loginForm">
+      <input type="email" id="email" placeholder="you@example.com" required />
+      <button type="submit">Start Session</button>
+    </form>
+    <div class="info">
+      Your time of access will determine how credits are used.<br>
       Make sure to log out if you're done.
     </div>
-
-    <div id="status" class="status"></div>
-  </form>
+    <div class="error" id="error"></div>
+  </div>
 
   <script>
-    // Replit helper endpoint
-    const HELPER_URL = "https://905e86aa-8575-4a91-8134-991936b778e6-00-3bab2jzyxizdq.spock.replit.dev/submit_email";
-
-    // Pull values the portal passed us
     const q = new URLSearchParams(location.search);
-    const clientId =
-      q.get("clientMac") || q.get("mac") || q.get("clientIp") || q.get("uip") || "manual-test";
-
-    // Use the portal's redirectUrl if present, otherwise use neverssl to avoid HTTPS cert warnings
-    const nextUrl = decodeURIComponent(q.get("redirectUrl") || "") || "http://neverssl.com";
-
+    const clientMac = q.get("clientMac") || "";
+    const redirectUrl = decodeURIComponent(q.get("redirectUrl") || "") || "http://neverssl.com";
+    
     const form = document.getElementById("loginForm");
-    const statusEl = document.getElementById("status");
+    const errorDiv = document.getElementById("error");
 
     form.addEventListener("submit", async (e) => {
       e.preventDefault();
-      statusEl.textContent = "";
-
-      const email = document.getElementById("email").value.trim();
-      if (!email) {
-        statusEl.textContent = "Enter a valid email.";
-        statusEl.style.color = "red";
-        return;
-      }
+      const email = document.getElementById("email").value;
 
       try {
-        // Post to helper as JSON
-        const res = await fetch(HELPER_URL, {
+        const res = await fetch("/submit_email", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ email: email, client_id: clientId })
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({ client_id: clientMac, email })
         });
 
-        if (!res.ok) {
-          const t = await res.text();
-          statusEl.textContent = "Error saving. Try again.";
-          statusEl.style.color = "red";
-          console.error("Helper error:", t);
-          return;
+        const data = await res.json();
+        if (res.ok) {
+          location.href = redirectUrl;
+        } else {
+          errorDiv.textContent = data.error || "Network error. Try again.";
         }
-
-        // Show saved and bounce to next page
-        statusEl.textContent = "Saved. Finishing sign-in…";
-        statusEl.style.color = "green";
-
-        // Small delay so users see feedback, then redirect
-        setTimeout(() => {
-          location.href = nextUrl;
-        }, 500);
-
       } catch (err) {
-        statusEl.textContent = "Network error. Try again.";
-        statusEl.style.color = "red";
-        console.error(err);
+        errorDiv.textContent = "Network error. Try again.";
       }
     });
   </script>
