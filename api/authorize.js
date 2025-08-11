@@ -1,55 +1,34 @@
-// api/authorize.js  (Vercel Serverless Function - CommonJS)
+// api/authorize.js
 const axios = require("axios").default;
-const tough = require("tough-cookie");
-const { wrapper } = require("axios-cookiejar-support");
 const https = require("https");
 
-/**
- * Helper to try an HTTP GET and return { ok, data, error }
- */
+/** Try GET and return { ok, data, err } */
 async function tryGet(http, url) {
   try {
     const r = await http.get(url, { headers: { Accept: "application/json" } });
     return { ok: true, data: r.data };
   } catch (err) {
-    return { ok: false, error: err };
+    return { ok: false, err };
   }
 }
 
-/**
- * Discover controllerId and the correct base:
- * 1) Try <OMADA_BASE>/api/info (root pattern)
- * 2) Try <OMADA_BASE>/omadac/api/info (omadac pattern)
- */
+/** Discover controllerId + correct base: root (/api/info) or /omadac (/omadac/api/info) */
 async function discoverController(http, base) {
   const b = base.replace(/\/$/, "");
 
-  // pattern A: root
+  // A) root
   const a = await tryGet(http, `${b}/api/info`);
-  if (a.ok && a.data && a.data.result && a.data.result.controllerId) {
-    return {
-      controllerId: a.data.result.controllerId,
-      usedBase: b,
-      infoPath: "root"
-    };
+  if (a.ok && a.data?.result?.controllerId) {
+    return { controllerId: a.data.result.controllerId, usedBase: b, mode: "root" };
   }
 
-  // pattern B: /omadac
-  const bTry = await tryGet(http, `${b}/omadac/api/info`);
-  if (bTry.ok && bTry.data && bTry.data.result && bTry.data.result.controllerId) {
-    return {
-      controllerId: bTry.data.result.controllerId,
-      usedBase: `${b}/omadac`,
-      infoPath: "omadac"
-    };
+  // B) /omadac
+  const o = await tryGet(http, `${b}/omadac/api/info`);
+  if (o.ok && o.data?.result?.controllerId) {
+    return { controllerId: o.data.result.controllerId, usedBase: `${b}/omadac`, mode: "omadac" };
   }
 
-  // fallbacks – if neither returned controllerId, still return best guess
-  return {
-    controllerId: null,
-    usedBase: `${b}/omadac`,
-    infoPath: "none"
-  };
+  return { controllerId: null, usedBase: `${b}/omadac`, mode: "unknown" };
 }
 
 module.exports = async (req, res) => {
@@ -66,7 +45,7 @@ module.exports = async (req, res) => {
   } = process.env;
 
   if (!OMADA_BASE || !OMADA_OPERATOR_USER || !OMADA_OPERATOR_PASS) {
-    console.error("authorize: missing env vars", { hasBase: !!OMADA_BASE, hasUser: !!OMADA_OPERATOR_USER, hasPass: !!OMADA_OPERATOR_PASS });
+    console.error("authorize: missing envs", { hasBase: !!OMADA_BASE, hasUser: !!OMADA_OPERATOR_USER, hasPass: !!OMADA_OPERATOR_PASS });
     res.status(500).json({ ok: false, error: "Missing env vars" });
     return;
   }
@@ -78,30 +57,27 @@ module.exports = async (req, res) => {
   }
 
   try {
+    // Self-signed cert ok
     const agent = new https.Agent({ rejectUnauthorized: false });
-    const jar = new tough.CookieJar();
-    const http = wrapper(axios.create({
-      jar,
-      withCredentials: true,
-      timeout: 10000,
-      httpsAgent: agent,
-    }));
 
-    // Discover controller ID and which base to use
+    // Single axios instance we’ll reuse
+    const http = axios.create({
+      timeout: 12000,
+      httpsAgent: agent,
+      validateStatus: () => true, // we'll handle error codes ourselves
+    });
+
+    // 1) Discover controller base + id
     const discovery = await discoverController(http, OMADA_BASE);
     console.log("authorize: discovery", discovery);
 
-    // If site is not provided by the controller redirect, you can set a default here
+    // Some firmwares don’t expose controllerId, but /omadac still works with a fixed segment
+    const controllerId = discovery.controllerId || "omadac";
+    const controllerBase = `${discovery.usedBase.replace(/\/$/, "")}/${controllerId}`;
     const siteId = site || "Default";
+    console.log("authorize: controllerBase", controllerBase, "siteId", siteId);
 
-    if (!discovery.controllerId) {
-      console.warn("authorize: controllerId not discovered from /api/info; continuing with guessed base");
-    }
-
-    const controllerBase = `${discovery.usedBase}/${discovery.controllerId || "omadac"}`.replace(/\/+$/, "");
-    console.log("authorize: controllerBase ->", controllerBase);
-
-    // 1) Hotspot operator login -> CSRF token
+    // 2) Operator login → get CSRF token + cookies
     const loginUrl = `${controllerBase}/api/v2/hotspot/login`;
     console.log("authorize: login ->", loginUrl);
 
@@ -111,16 +87,24 @@ module.exports = async (req, res) => {
       { headers: { "Content-Type": "application/json", Accept: "application/json" } }
     );
 
-    console.log("authorize: login data", login.data);
-    if (!login.data || login.data.errorCode !== 0) {
-      return res.status(502).json({ ok: false, error: "Hotspot login failed", detail: login.data });
-    }
-    const csrf = login.data.result?.token;
-    if (!csrf) {
-      return res.status(502).json({ ok: false, error: "No CSRF token from hotspot login" });
+    // Must be HTTP 200 and errorCode 0
+    if (login.status !== 200 || !login.data || login.data.errorCode !== 0) {
+      console.error("authorize: login failed", { status: login.status, data: login.data });
+      res.status(502).json({ ok: false, error: "Hotspot login failed", detail: login.data || login.status });
+      return;
     }
 
-    // 2) Authorize client (time in microseconds)
+    const csrf = login.data?.result?.token;
+    const setCookie = login.headers["set-cookie"] || [];
+    const cookieHeader = setCookie.map(c => c.split(";")[0]).join("; ");
+    if (!csrf || !cookieHeader) {
+      console.error("authorize: missing csrf/cookie", { csrf: !!csrf, cookieHeader });
+      res.status(502).json({ ok: false, error: "Missing CSRF or session cookie from login" });
+      return;
+    }
+    console.log("authorize: got csrf + cookies");
+
+    // 3) Authorize client (duration in microseconds)
     const timeMicros = String(BigInt(SESSION_MINUTES) * 60n * 1_000_000n);
     const payload = {
       clientMac,
@@ -140,15 +124,17 @@ module.exports = async (req, res) => {
         "Content-Type": "application/json",
         Accept: "application/json",
         "Csrf-Token": csrf,
+        "Cookie": cookieHeader,
       },
     });
 
-    console.log("authorize: auth data", auth.data);
-
-    if (!auth.data || auth.data.errorCode !== 0) {
-      return res.status(502).json({ ok: false, error: "Authorization failed", detail: auth.data });
+    if (auth.status !== 200 || !auth.data || auth.data.errorCode !== 0) {
+      console.error("authorize: auth failed", { status: auth.status, data: auth.data });
+      res.status(502).json({ ok: false, error: "Authorization failed", detail: auth.data || auth.status });
+      return;
     }
 
+    console.log("authorize: success for", clientMac);
     res.json({ ok: true, redirectUrl: redirectUrl || "http://neverssl.com" });
   } catch (err) {
     const detail = err?.response?.data || err.message || String(err);
