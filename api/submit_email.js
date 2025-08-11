@@ -1,27 +1,14 @@
 // api/submit_email.js  (Vercel Serverless Function - CommonJS)
-
 module.exports = async (req, res) => {
   if (req.method !== 'POST') {
-    res.status(405).json({ error: 'Method not allowed' });
-    return;
+    return res.status(405).json({ ok: false, error: 'Use POST' });
   }
-
   try {
     const { email, client_id } = req.body || {};
-    if (!email) {
-      res.status(400).json({ error: 'Email required' });
-      return;
-    }
-
-    console.log('Email capture:', {
-      email,
-      client_id: client_id || 'n/a',
-      ua: req.headers['user-agent']
-    });
-
-    res.status(200).json({ status: 'saved' });
+    console.log('Email capture:', { email, client_id, ua: req.headers['user-agent'] });
+    return res.status(200).json({ ok: true });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Server error' });
+    console.error('submit_email error:', err);
+    return res.status(500).json({ ok: false, error: 'Server error' });
   }
 };
