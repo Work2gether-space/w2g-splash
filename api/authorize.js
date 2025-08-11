@@ -1,8 +1,56 @@
 // api/authorize.js  (Vercel Serverless Function - CommonJS)
-const axios = require("axios");
-const { CookieJar } = require("tough-cookie");
+const axios = require("axios").default;
+const tough = require("tough-cookie");
 const { wrapper } = require("axios-cookiejar-support");
 const https = require("https");
+
+/**
+ * Helper to try an HTTP GET and return { ok, data, error }
+ */
+async function tryGet(http, url) {
+  try {
+    const r = await http.get(url, { headers: { Accept: "application/json" } });
+    return { ok: true, data: r.data };
+  } catch (err) {
+    return { ok: false, error: err };
+  }
+}
+
+/**
+ * Discover controllerId and the correct base:
+ * 1) Try <OMADA_BASE>/api/info (root pattern)
+ * 2) Try <OMADA_BASE>/omadac/api/info (omadac pattern)
+ */
+async function discoverController(http, base) {
+  const b = base.replace(/\/$/, "");
+
+  // pattern A: root
+  const a = await tryGet(http, `${b}/api/info`);
+  if (a.ok && a.data && a.data.result && a.data.result.controllerId) {
+    return {
+      controllerId: a.data.result.controllerId,
+      usedBase: b,
+      infoPath: "root"
+    };
+  }
+
+  // pattern B: /omadac
+  const bTry = await tryGet(http, `${b}/omadac/api/info`);
+  if (bTry.ok && bTry.data && bTry.data.result && bTry.data.result.controllerId) {
+    return {
+      controllerId: bTry.data.result.controllerId,
+      usedBase: `${b}/omadac`,
+      infoPath: "omadac"
+    };
+  }
+
+  // fallbacks – if neither returned controllerId, still return best guess
+  return {
+    controllerId: null,
+    usedBase: `${b}/omadac`,
+    infoPath: "none"
+  };
+}
 
 module.exports = async (req, res) => {
   if (req.method !== "POST") {
@@ -10,90 +58,101 @@ module.exports = async (req, res) => {
     return;
   }
 
+  const {
+    OMADA_BASE,
+    OMADA_OPERATOR_USER,
+    OMADA_OPERATOR_PASS,
+    SESSION_MINUTES = "240",
+  } = process.env;
+
+  if (!OMADA_BASE || !OMADA_OPERATOR_USER || !OMADA_OPERATOR_PASS) {
+    console.error("authorize: missing env vars", { hasBase: !!OMADA_BASE, hasUser: !!OMADA_OPERATOR_USER, hasPass: !!OMADA_OPERATOR_PASS });
+    res.status(500).json({ ok: false, error: "Missing env vars" });
+    return;
+  }
+
+  const { clientMac, apMac, ssidName, radioId, site, redirectUrl } = req.body || {};
+  if (!clientMac) {
+    res.status(400).json({ ok: false, error: "Missing clientMac" });
+    return;
+  }
+
   try {
-    const {
-      OMADA_BASE,           // e.g. https://98.114.198.237:9444
-      OMADA_CONTROLLER_ID,  // usually "omadac" on OC200 (confirm in your portal)
-      OMADA_OPERATOR_USER,  // hotspot operator username
-      OMADA_OPERATOR_PASS,  // hotspot operator password
-      SESSION_MINUTES = "240",
-    } = process.env;
-
-    if (!OMADA_BASE || !OMADA_CONTROLLER_ID || !OMADA_OPERATOR_USER || !OMADA_OPERATOR_PASS) {
-      res.status(500).json({ ok: false, error: "Missing env vars" });
-      return;
-    }
-
-    const { clientMac, apMac, ssidName, radioId, site, redirectUrl } = req.body || {};
-    if (!clientMac || !site) {
-      res.status(400).json({ ok: false, error: "Missing clientMac or site" });
-      return;
-    }
-
-    // Build base like: https://PUBLIC_IP:9444/omadac
-    const base = `${OMADA_BASE.replace(/\/$/, "")}/${OMADA_CONTROLLER_ID}`;
-
-    // Accept self-signed cert on OC200
     const agent = new https.Agent({ rejectUnauthorized: false });
-
-    // Axios with cookie jar for session + CSRF
-    const jar = new CookieJar();
+    const jar = new tough.CookieJar();
     const http = wrapper(axios.create({
       jar,
       withCredentials: true,
-      timeout: 15000,
+      timeout: 10000,
       httpsAgent: agent,
-      headers: { "Accept": "application/json" }
     }));
 
-    // 1) Hotspot login -> CSRF token
-    const login = await http.post(`${base}/api/v2/hotspot/login`, {
-      name: OMADA_OPERATOR_USER,
-      password: OMADA_OPERATOR_PASS
-    }, { headers: { "Content-Type": "application/json" } });
+    // Discover controller ID and which base to use
+    const discovery = await discoverController(http, OMADA_BASE);
+    console.log("authorize: discovery", discovery);
 
-    if (!login.data || login.data.errorCode !== 0) {
-      res.status(502).json({ ok: false, error: "Hotspot login failed", detail: login.data });
-      return;
+    // If site is not provided by the controller redirect, you can set a default here
+    const siteId = site || "Default";
+
+    if (!discovery.controllerId) {
+      console.warn("authorize: controllerId not discovered from /api/info; continuing with guessed base");
     }
 
+    const controllerBase = `${discovery.usedBase}/${discovery.controllerId || "omadac"}`.replace(/\/+$/, "");
+    console.log("authorize: controllerBase ->", controllerBase);
+
+    // 1) Hotspot operator login -> CSRF token
+    const loginUrl = `${controllerBase}/api/v2/hotspot/login`;
+    console.log("authorize: login ->", loginUrl);
+
+    const login = await http.post(
+      loginUrl,
+      { name: OMADA_OPERATOR_USER, password: OMADA_OPERATOR_PASS },
+      { headers: { "Content-Type": "application/json", Accept: "application/json" } }
+    );
+
+    console.log("authorize: login data", login.data);
+    if (!login.data || login.data.errorCode !== 0) {
+      return res.status(502).json({ ok: false, error: "Hotspot login failed", detail: login.data });
+    }
     const csrf = login.data.result?.token;
     if (!csrf) {
-      res.status(502).json({ ok: false, error: "No CSRF token" });
-      return;
+      return res.status(502).json({ ok: false, error: "No CSRF token from hotspot login" });
     }
 
-    // 2) Authorize client (time is microseconds)
-    const timeMicros = String(BigInt(SESSION_MINUTES) * 60n * 1000000n);
+    // 2) Authorize client (time in microseconds)
+    const timeMicros = String(BigInt(SESSION_MINUTES) * 60n * 1_000_000n);
     const payload = {
       clientMac,
       apMac,
       ssidName,
       radioId: radioId ? Number(radioId) : 1,
-      site,
+      site: siteId,
       time: timeMicros,
-      authType: 4
+      authType: 4, // external portal
     };
 
-    const auth = await http.post(`${base}/api/v2/hotspot/extPortal/auth`, payload, {
+    const authUrl = `${controllerBase}/api/v2/hotspot/extPortal/auth`;
+    console.log("authorize: auth ->", authUrl, payload);
+
+    const auth = await http.post(authUrl, payload, {
       headers: {
         "Content-Type": "application/json",
-        "Csrf-Token": csrf
-      }
+        Accept: "application/json",
+        "Csrf-Token": csrf,
+      },
     });
 
+    console.log("authorize: auth data", auth.data);
+
     if (!auth.data || auth.data.errorCode !== 0) {
-      res.status(502).json({ ok: false, error: "Authorization failed", detail: auth.data });
-      return;
+      return res.status(502).json({ ok: false, error: "Authorization failed", detail: auth.data });
     }
 
     res.json({ ok: true, redirectUrl: redirectUrl || "http://neverssl.com" });
   } catch (err) {
-    console.error("authorize error:", err?.response?.data || err.message || err);
-    res.status(500).json({
-      ok: false,
-      error: err.message || "Internal error",
-      detail: err?.response?.data
-    });
+    const detail = err?.response?.data || err.message || String(err);
+    console.error("authorize: ERROR", detail);
+    res.status(500).json({ ok: false, error: "Internal error", detail });
   }
 };
