@@ -84,50 +84,75 @@
     <div id="status" class="status"></div>
   </form>
 
-  <script>
-    // Build values from the portal query string
-    const q = new URLSearchParams(location.search);
-    const clientId = q.get('clientMac') || q.get('mac') || q.get('clientIp') || q.get('uip') || 'manual-test';
-    const nextUrl = decodeURIComponent(q.get('redirectUrl') || '') || 'http://neverssl.com';
+<script>
+  // Build values from the portal query string
+  const q = new URLSearchParams(location.search);
 
-    const form = document.getElementById('loginForm');
-    const statusEl = document.getElementById('status');
+  // Omada usually includes these in the external portal URL:
+  // clientMac, apMac, ssidName, radioId, site, redirectUrl
+  const clientMac = q.get('clientMac') || q.get('mac') || '';
+  const apMac     = q.get('apMac')     || q.get('ap')  || '';
+  const ssidName  = q.get('ssidName')  || q.get('ssid')|| '';
+  const radioId   = q.get('radioId')   || q.get('radio')|| '';
+  const site      = q.get('site')      || '';
+  const nextUrl   = decodeURIComponent(q.get('redirectUrl') || '') || 'http://neverssl.com';
 
-    form.addEventListener('submit', async (e) => {
-      e.preventDefault();
-      statusEl.textContent = '';
+  // keep a friendly client_id for logging if portal params are missing
+  const clientIdForLog = clientMac || q.get('clientIp') || q.get('uip') || 'manual-test';
 
-      const email = document.getElementById('email').value.trim();
-      if (!email) {
-        statusEl.textContent = 'Enter a valid email.';
+  const form = document.getElementById('loginForm');
+  const statusEl = document.getElementById('status');
+
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    statusEl.textContent = '';
+
+    const email = document.getElementById('email').value.trim();
+    if (!email) {
+      statusEl.textContent = 'Enter a valid email.';
+      statusEl.style.color = 'red';
+      return;
+    }
+
+    try {
+      // Call our backend authorizer (this talks to the OC200)
+      const res = await fetch('/api/authorize', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email,
+          client_id: clientIdForLog,
+          clientMac, apMac, ssidName, radioId, site,
+          redirectUrl: nextUrl
+        })
+      });
+
+      if (!res.ok) {
+        const t = await res.text();
+        console.error('API error:', t);
+        statusEl.textContent = 'Network/authorize error. Try again.';
         statusEl.style.color = 'red';
         return;
       }
 
-      try {
-        const res = await fetch('/api/submit_email', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ email, client_id: clientId })
-        });
-
-        if (!res.ok) {
-          const t = await res.text();
-          console.error('API error:', t);
-          statusEl.textContent = 'Network error. Try again.';
-          statusEl.style.color = 'red';
-          return;
-        }
-
+      const data = await res.json();
+      if (data && data.ok) {
         statusEl.textContent = 'Saved. Finishing sign-in…';
         statusEl.style.color = 'green';
-        setTimeout(() => (location.href = nextUrl), 500);
-      } catch (err) {
-        console.error(err);
-        statusEl.textContent = 'Network error. Try again.';
+        // Prefer server-provided redirect, else the portal’s original redirectUrl
+        const go = data.redirectUrl || nextUrl;
+        setTimeout(() => { location.href = go; }, 400);
+      } else {
+        console.error('Authorize failed:', data);
+        statusEl.textContent = 'Authorization failed. Try again.';
         statusEl.style.color = 'red';
       }
-    });
-  </script>
+    } catch (err) {
+      console.error(err);
+      statusEl.textContent = 'Network error. Try again.';
+      statusEl.style.color = 'red';
+    }
+  });
+</script>
 </body>
 </html>
