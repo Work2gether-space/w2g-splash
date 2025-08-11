@@ -1,3 +1,6 @@
+console.log("DEBUG: authorize.js build version 2025-08-11a");
+
+
 // api/authorize.js
 // Auto-detect controller path: tries /omadac, /omada, and root.
 // No cookie-jar; we forward Set-Cookie + Csrf-Token manually.
