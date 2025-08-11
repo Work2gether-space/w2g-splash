@@ -4,145 +4,174 @@
   <meta charset="UTF-8" />
   <title>Work2gether Login</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <link href="https://fonts.googleapis.com/css2?family=Montserrat&display=swap" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;600;700&display=swap" rel="stylesheet" />
   <style>
+    :root { --accent:#B4340E; --ink:#000; --bg:#fff; }
+    * { box-sizing:border-box; }
     body {
-      margin: 0;
-      font-family: 'Montserrat', sans-serif;
-      background: #fff;
-      color: #000;
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      height: 100vh;
+      margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
+      font-family:'Montserrat',system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; background:var(--bg); color:var(--ink);
     }
-    .login-box {
-      width: 320px;
-      padding: 2.5rem;
-      border: 1px solid #000;
-      box-sizing: border-box;
-      box-shadow: 0 0 15px rgba(180, 52, 14, 0.3);
-      border-radius: 4px;
-      text-align: center;
+    .card {
+      width: 320px; padding: 2.25rem; border:1px solid var(--ink); border-radius:4px;
+      box-shadow:0 0 15px rgba(180,52,14,.25); text-align:center; background:#fff;
     }
-    h2 { color: #B4340E; margin-bottom: 1.5rem; font-weight: 700; }
-    p { margin-bottom: 2rem; font-weight: 500; font-size: 1rem; }
+    h1 { font-size:1.15rem; margin:0 0 .25rem; color:var(--accent); font-weight:700; }
+    h2 { font-size:.95rem; margin:0 0 1rem; font-weight:600; }
     input[type="email"] {
-      width: 100%; padding: 0.75rem 1rem; font-size: 1rem;
-      border: 1px solid #000; border-radius: 0; box-sizing: border-box; margin-bottom: 1.5rem;
-      font-family: 'Montserrat', sans-serif;
+      width:100%; padding:.75rem 1rem; border:1px solid #000; border-radius:0; margin:.5rem 0 1rem;
+      font:inherit;
     }
-    button[type="submit"] {
-      width: 100%; padding: 0.75rem 1rem; font-size: 1rem; font-weight: 700;
-      border: none; background: #000; color: #fff; cursor: pointer; transition: all 0.3s ease; border-radius: 0;
-      font-family: 'Montserrat', sans-serif;
+    button {
+      width:100%; padding:.75rem 1rem; border:0; background:#000; color:#fff; font-weight:700; cursor:pointer;
     }
-    button[type="submit"]:hover, button[type="submit"]:focus {
-      background: transparent; border: 1px solid #000; color: #000; outline: none;
+    button:hover, button:focus { outline:0; background:#fff; color:#000; border:1px solid #000; }
+    .fine { margin-top:1rem; font-size:.82rem; color:#555; line-height:1.25; }
+    .status { min-height:1.2em; margin-top:.75rem; font-size:.9rem; }
+    .status.err { color:#b00020; }
+    .status.ok { color:#0a7a33; }
+    .debug {
+      margin-top:1rem; text-align:left; font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace;
+      font-size:.78rem; background:#fafafa; border:1px dashed #bbb; padding:.75rem; display:none; max-height:200px; overflow:auto;
     }
-    .message { margin-top: 1.0rem; font-size: 0.9rem; font-weight: 500; color: #555; line-height: 1.3; }
-    .status  { margin-top: 0.75rem; min-height: 1.2em; }
-    .small   { margin-top: .5rem; font-size: .8rem; color:#666; }
-    .dim     { color:#999; font-size: .8rem; margin-top:.25rem;}
   </style>
 </head>
 <body>
-  <form class="login-box" id="loginForm" autocomplete="on" novalidate>
-    <h2>Welcome to Work2gether</h2>
-    <p>Please log in to start your session</p>
+  <main class="card">
+    <h1>Welcome to Work2gether</h1>
+    <h2>Please log in to start your session</h2>
 
-    <input type="email" id="email" name="email" placeholder="Your Email" required />
-    <button type="submit">Start Session</button>
+    <form id="form" novalidate>
+      <input type="email" id="email" name="email" placeholder="Your Email" autocomplete="email" required />
+      <button type="submit">Start Session</button>
+      <div id="status" class="status"></div>
+    </form>
 
-    <div class="message">
-      Your time of access will determine how credits are used.<br />
+    <p class="fine">
+      Your time of access will determine how credits are used.
       Make sure to log out if you're done.
-    </div>
-    <div id="status" class="status"></div>
-    <div class="dim" id="qs"></div>
-  </form>
+    </p>
+
+    <details id="dbgWrap" class="debug">
+      <summary>Debug (payload & URL params)</summary>
+      <pre id="debugBox"></pre>
+    </details>
+  </main>
 
   <script>
-    // Read and show important portal query string values (for debugging)
-    const q = new URLSearchParams(location.search);
-    const qsEl = document.getElementById('qs');
+    // --- Helpers -------------------------------------------------------------
+    const qs = new URLSearchParams(location.search);
+
+    // Pull Omada params (names seen across OC200/SDN variants)
     const portalParams = {
-      clientMac: q.get('clientMac') || q.get('mac') || '',
-      apMac:     q.get('apMac') || '',
-      ssidName:  q.get('ssidName') || '',
-      radioId:   q.get('radioId') || '',
-      site:      q.get('site') || '',
-      redirectUrl: decodeURIComponent(q.get('redirectUrl') || '') || 'http://neverssl.com'
+      clientMac : qs.get('clientMac') || qs.get('mac') || '',
+      apMac     : qs.get('apMac')     || '',
+      ssidName  : qs.get('ssidName')  || qs.get('ssid') || '',
+      radioId   : qs.get('radioId')   || qs.get('radio') || '',
+      site      : qs.get('site')      || '',
+      clientIp  : qs.get('clientIp')  || qs.get('uip') || '',
+      // Omada typically includes redirectUrl; fall back to neverssl
+      redirectUrl: decodeURIComponent(qs.get('redirectUrl') || '') || 'http://neverssl.com'
     };
-    qsEl.textContent = `site=${portalParams.site} • clientMac=${portalParams.clientMac} • apMac=${portalParams.apMac}`;
 
-    const form = document.getElementById('loginForm');
-    const statusEl = document.getElementById('status');
+    // Optional debug mode: add ?debug=1 to the splash URL
+    const DEBUG = qs.get('debug') === '1';
 
-    async function postJson(url, body) {
+    const $form   = document.getElementById('form');
+    const $status = document.getElementById('status');
+    const $dbg    = document.getElementById('dbgWrap');
+    const $box    = document.getElementById('debugBox');
+
+    if (DEBUG) {
+      $dbg.style.display = 'block';
+      $box.textContent = [
+        'URL Params:', JSON.stringify(portalParams, null, 2),
+        '',
+        'Full query:', location.search
+      ].join('\n');
+      console.log('[splash] URL params', portalParams);
+    }
+
+    function setStatus(msg, kind='') {
+      $status.className = 'status ' + (kind || '');
+      $status.textContent = msg || '';
+    }
+
+    async function postJSON(url, body) {
       const res = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body || {})
+        body: JSON.stringify(body)
       });
-      const text = await res.text();
-      let data;
-      try { data = JSON.parse(text); } catch { data = { raw: text }; }
-      return { ok: res.ok, status: res.status, data };
+      return { res, text: await res.text() };
     }
 
-    form.addEventListener('submit', async (e) => {
+    // --- Submit flow ---------------------------------------------------------
+    $form.addEventListener('submit', async (e) => {
       e.preventDefault();
-      statusEl.textContent = '';
+      setStatus('');
 
       const email = document.getElementById('email').value.trim();
       if (!email) {
-        statusEl.textContent = 'Enter a valid email.';
-        statusEl.style.color = 'red';
+        setStatus('Enter a valid email.', 'err');
         return;
       }
 
+      // Build payload sent to both endpoints
+      const payload = {
+        email,
+        clientMac : portalParams.clientMac,
+        apMac     : portalParams.apMac,
+        ssidName  : portalParams.ssidName,
+        radioId   : portalParams.radioId,
+        site      : portalParams.site,
+        clientIp  : portalParams.clientIp,
+        redirectUrl: portalParams.redirectUrl
+      };
+
+      if (DEBUG) {
+        $box.textContent += '\n\nSubmit payload:\n' + JSON.stringify(payload, null, 2);
+        console.log('[splash] submit payload', payload);
+      }
+
       try {
-        // 1) Capture email (always returns 200 w/ logs)
-        const cap = await postJson('/api/submit_email', { email, client_id: portalParams.clientMac || 'n/a' });
-        if (!cap.ok) {
-          console.error('submit_email error:', cap);
-          statusEl.textContent = 'Network error (capture). Try again.';
-          statusEl.style.color = 'red';
+        // 1) Optional: record the email (non-blocking if it fails)
+        try {
+          const r1 = await postJSON('/api/submit_email', { email, client_id: portalParams.clientMac || 'manual' });
+          if (DEBUG) console.log('[splash] submit_email', r1.res.status, r1.text);
+        } catch (err) {
+          if (DEBUG) console.warn('[splash] submit_email failed', err);
+        }
+
+        // 2) Ask Vercel function to authorize on Omada
+        setStatus('Authorizing…');
+        const { res, text } = await postJSON('/api/authorize', payload);
+
+        if (!res.ok) {
+          if (DEBUG) console.error('[splash] /api/authorize error', res.status, text);
+          setStatus('Could not authorize your session. Try again.', 'err');
           return;
         }
 
-        // 2) Ask our API to authorize this client with Omada
-        statusEl.textContent = 'Authorizing…';
-        statusEl.style.color = '#333';
+        let data = {};
+        try { data = JSON.parse(text); } catch { data = {}; }
+        if (DEBUG) console.log('[splash] /api/authorize ok', data);
 
-        const authBody = {
-          clientMac: portalParams.clientMac,
-          apMac: portalParams.apMac,
-          ssidName: portalParams.ssidName,
-          radioId: portalParams.radioId,
-          site: portalParams.site,
-          redirectUrl: portalParams.redirectUrl
-        };
-        const auth = await postJson('/api/authorize', authBody);
+        setStatus('Authorized. Finishing sign-in…', 'ok');
 
-        if (!auth.ok) {
-          console.error('authorize error payload:', auth);
-          statusEl.innerHTML = 'Could not authorize your session. Try again.';
-          statusEl.style.color = 'red';
-          return;
-        }
-
-        const go = (auth.data && auth.data.redirectUrl) ? auth.data.redirectUrl : portalParams.redirectUrl;
-        statusEl.textContent = 'Authorized. Finishing sign-in…';
-        statusEl.style.color = 'green';
-        setTimeout(() => (location.href = go), 500);
+        // Use redirectUrl from API (if returned) or the one from Omada/fallback
+        const next = (data && data.redirectUrl) || portalParams.redirectUrl || 'http://neverssl.com';
+        setTimeout(() => { location.href = next; }, 400);
       } catch (err) {
-        console.error('fatal error:', err);
-        statusEl.textContent = 'Network error. Try again.';
-        statusEl.style.color = 'red';
+        if (DEBUG) console.error('[splash] fatal', err);
+        setStatus('Network error. Try again.', 'err');
       }
     });
+
+    // If Omada didn’t supply params, surface that in debug (helps on manual tests)
+    if (DEBUG && (!portalParams.clientMac || !portalParams.site)) {
+      $box.textContent += '\n\nWARNING: Missing clientMac or site from URL. The controller may reject authorization.';
+    }
   </script>
 </body>
 </html>
