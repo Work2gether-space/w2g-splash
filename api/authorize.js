@@ -1,177 +1,184 @@
 console.log("DEBUG: authorize.js build version 2025-08-11a");
 
-// api/authorize.js — fetch-only implementation (no axios, no cookie-jar)
-// Node 18+ on Vercel has global fetch.
-// Uses NODE_TLS_REJECT_UNAUTHORIZED=0 (set in env) to accept OC200 self-signed cert.
+// api/authorize.js  (Vercel, Node 18+)
 
 export default async function handler(req, res) {
+  // Simple request-id for correlating logs
+  const rid = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+
+  const log = (...args) => console.log(`[authorize][${rid}]`, ...args);
+  const err = (...args) => console.error(`[authorize][${rid}]`, ...args);
+
   if (req.method !== 'POST') {
-    res.status(405).json({ ok: false, error: 'Use POST' });
-    return;
+    return res.status(405).json({ ok: false, error: 'Use POST' });
   }
 
-  const buildId = '2025-08-11c';
+  // --- Load deps (ESM-compatible for Vercel Node 18) ---
+  const axios = (await import('axios')).default;
+  const https = await import('https');
+  const { CookieJar } = await import('tough-cookie');
+  const { wrapper } = await import('axios-cookiejar-support');
+
   try {
     const {
-      OMADA_BASE,
-      OMADA_OPERATOR_USER,
-      OMADA_OPERATOR_PASS,
-      SESSION_MINUTES = '240',
+      OMADA_BASE,            // e.g. https://98.114.198.237:9444   (public IP + exposed management port)
+      OMADA_OPERATOR_USER,   // hotspot operator username
+      OMADA_OPERATOR_PASS,   // hotspot operator password
+      SESSION_MINUTES = '240'
     } = process.env;
 
+    // --- Validate env ---
     if (!OMADA_BASE || !OMADA_OPERATOR_USER || !OMADA_OPERATOR_PASS) {
-      console.error('ENV MISSING', { hasBase: !!OMADA_BASE, hasUser: !!OMADA_OPERATOR_USER, hasPass: !!OMADA_OPERATOR_PASS });
-      res.status(500).json({ ok: false, error: 'Missing env vars' });
-      return;
+      err('Missing env vars. Need OMADA_BASE, OMADA_OPERATOR_USER, OMADA_OPERATOR_PASS.');
+      return res.status(500).json({ ok: false, error: 'Missing env vars.' });
     }
 
-    const body = await safeJson(req);
-    const {
-      clientMac = '',
-      apMac = '',
-      ssidName = '',
-      radioId = '',
-      site = '',
-      clientIp = '',
-      redirectUrl = 'http://neverssl.com',
-      email = '',
-    } = body || {};
+    const base = OMADA_BASE.replace(/\/+$/, ''); // no trailing slash
+    const body = (req.body && typeof req.body === 'object') ? req.body : {};
 
-    console.log('DEBUG: authorize.js build', buildId);
-    console.log('REQUEST BODY (redacted):', {
-      clientMac, apMac, ssidName, radioId, site, clientIp,
-      redirectUrl, emailRedacted: email ? 'yes' : 'no'
+    // These should come from the splash redirect (client page reads URL params and posts them).
+    // We also accept alternative names just in case.
+    const clientMac = body.clientMac || body.client_id || '';
+    const apMac     = body.apMac || '';
+    const ssidName  = body.ssidName || body.ssid || '';
+    const radioId   = body.radioId || body.radio || '';
+    const site      = body.site || '';
+    const clientIp  = body.clientIp || req.headers['x-forwarded-for'] || '';
+    const redirectUrl = body.redirectUrl || 'http://neverssl.com';
+
+    log('REQUEST BODY (redacted):', {
+      clientMac: clientMac ? '(present)' : '',
+      apMac:     apMac ? '(present)' : '',
+      ssidName:  ssidName || '',
+      radioId:   radioId || '',
+      site:      site || '',
+      clientIp:  clientIp || '',
+      redirectUrl
     });
 
+    // --- Validate required fields from splash redirect ---
+    // If these are empty, authorization will fail. Better to return a 400 so we know early.
     if (!clientMac || !site) {
-      res.status(400).json({ ok: false, error: 'Missing clientMac or site' });
-      return;
+      err('Missing required fields from splash: clientMac or site is empty.');
+      return res.status(400).json({
+        ok: false,
+        error: 'Missing clientMac or site from splash redirect.',
+        hint: 'Ensure your Omada portal passes clientMac, site, apMac, ssidName, radioId in the redirect URL.'
+      });
     }
 
-    // Normalize base; try common controller prefixes in order
-    const bases = normalizeBases(OMADA_BASE);
+    // --- HTTP client with cookie jar & self-signed cert allowed ---
+    const jar = new CookieJar();
+    const agent = new https.Agent({ rejectUnauthorized: false }); // self-signed on OC200
+    const http = wrapper(
+      axios.create({
+        jar,
+        withCredentials: true,
+        timeout: 15000,
+        httpsAgent: agent
+      })
+    );
 
-    // Attempt login on the first base that responds
-    let loginResult = null;
-    for (const base of bases) {
-      loginResult = await hotspotLogin(base, OMADA_OPERATOR_USER, OMADA_OPERATOR_PASS);
-      if (loginResult.ok) {
-        loginResult.base = base;
-        break;
+    // Try a few likely controller path prefixes:
+    // OC200 often serves API at /omada; sometimes it is directly at root.
+    const pathCandidates = ['', '/omada', '/omadac'];
+
+    // helper to login at a given path, returning {csrf, usedPath} or throwing error
+    const tryLogin = async (prefix) => {
+      const loginUrl = `${base}${prefix}/api/v2/hotspot/login`;
+      log('LOGIN try:', loginUrl);
+
+      try {
+        const resp = await http.post(
+          loginUrl,
+          { name: OMADA_OPERATOR_USER, password: OMADA_OPERATOR_PASS },
+          { headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' } }
+        );
+
+        // Omada v5 returns { errorCode: 0, result: { token } } on success
+        const data = resp && resp.data ? resp.data : {};
+        if (data.errorCode === 0 && data.result && data.result.token) {
+          log('LOGIN success on', loginUrl);
+          return { csrf: data.result.token, usedPath: prefix };
+        }
+
+        err('LOGIN failed on', loginUrl, 'detail:', JSON.stringify(data));
+        throw new Error(`login failed: ${JSON.stringify(data)}`);
+      } catch (e) {
+        // Axios error: capture response body if present
+        const detail = e?.response?.data || e.message || String(e);
+        err('LOGIN HTTP error on', loginUrl, '-', detail);
+        throw e;
       }
-      console.warn('LOGIN failed on base', base, 'detail:', loginResult.detail);
+    };
+
+    // Attempt login across candidates
+    let csrf = null;
+    let apiPrefix = null;
+    let loginErrs = [];
+    for (const p of pathCandidates) {
+      try {
+        const r = await tryLogin(p);
+        csrf = r.csrf;
+        apiPrefix = p;
+        break;
+      } catch (e) {
+        loginErrs.push(p);
+      }
     }
 
-    if (!loginResult || !loginResult.ok) {
-      console.error('LOGIN failed on all bases');
-      res.status(502).json({ ok: false, error: 'Hotspot login failed', detail: loginResult?.detail || null });
-      return;
+    if (!csrf || apiPrefix === null) {
+      err('LOGIN failed on all bases. Tried paths:', loginErrs.join(', '));
+      return res.status(502).json({ ok: false, error: 'Login failed on all bases.' });
     }
 
-    const { base: goodBase, cookie, csrf } = loginResult;
+    // --- Authorize the client ---
+    // Time is in microseconds per Omada API.
+    const timeMicros = String(BigInt(SESSION_MINUTES) * 60n * 1000000n);
 
-    // Build authorization payload
-    const timeMicros = String(BigInt(SESSION_MINUTES) * 60n * 1_000_000n);
-    const authPayload = {
+    const authUrl = `${base}${apiPrefix}/api/v2/hotspot/extPortal/auth`;
+    const payload = {
       clientMac,
       apMac,
       ssidName,
       radioId: radioId ? Number(radioId) : 1,
       site,
       time: timeMicros,
-      authType: 4, // external portal
+      authType: 4
     };
 
-    const authResp = await fetch(`${goodBase}/api/v2/hotspot/extPortal/auth`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-        'Csrf-Token': csrf,
-        'Cookie': cookie,
-      },
-      body: JSON.stringify(authPayload),
+    log('AUTHORIZE POST ->', authUrl, 'payload:', {
+      clientMac, apMac, ssidName, radioId: payload.radioId, site, time: String(timeMicros)
     });
 
-    const authText = await authResp.text();
-    let authJson = {};
-    try { authJson = JSON.parse(authText); } catch {}
+    try {
+      const auth = await http.post(
+        authUrl,
+        payload,
+        {
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+            'Csrf-Token': csrf
+          }
+        }
+      );
 
-    if (!authResp.ok || !authJson || authJson.errorCode !== 0) {
-      console.error('AUTH failed', {
-        status: authResp.status, statusText: authResp.statusText, body: authText
-      });
-      res.status(502).json({ ok: false, error: 'Authorization failed', detail: authJson || authText });
-      return;
+      const a = auth && auth.data ? auth.data : {};
+      if (a.errorCode === 0) {
+        log('AUTH success. Redirecting to', redirectUrl);
+        return res.status(200).json({ ok: true, redirectUrl });
+      }
+
+      err('AUTH failed detail:', JSON.stringify(a));
+      return res.status(502).json({ ok: false, error: 'Authorization failed', detail: a });
+    } catch (e) {
+      const detail = e?.response?.data || e.message || String(e);
+      err('AUTH HTTP error:', detail);
+      return res.status(502).json({ ok: false, error: 'Authorization HTTP error', detail });
     }
-
-    console.log('AUTH OK', { base: goodBase, site, clientMac });
-    res.json({ ok: true, redirectUrl });
-  } catch (err) {
-    console.error('authorize handler error:', err?.stack || err);
-    res.status(500).json({ ok: false, error: err.message || 'Internal error' });
-  }
-}
-
-/* ---------------------- helpers ---------------------- */
-
-function normalizeBases(raw) {
-  // Strip trailing slashes
-  const root = String(raw).replace(/\/+$/, '');
-
-  // If caller already included /omada or /omadac, try that first
-  const lower = root.toLowerCase();
-  if (lower.endsWith('/omada') || lower.endsWith('/omadac')) {
-    return [root, root.replace(/\/omadac$/i, ''), root.replace(/\/omada$/i, '')];
-  }
-
-  // Otherwise try common bases in order
-  return [`${root}/omada`, `${root}/omadac`, root];
-}
-
-async function hotspotLogin(base, name, password) {
-  try {
-    const r = await fetch(`${base}/api/v2/hotspot/login`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-      body: JSON.stringify({ name, password }),
-    });
-
-    const text = await r.text();
-    let json = {};
-    try { json = JSON.parse(text); } catch {}
-
-    // Expect { errorCode: 0, result: { token: '...' } } and a Set-Cookie header
-    const csrf = json?.result?.token || '';
-    const setCookie = r.headers.get('set-cookie') || '';
-
-    if (!r.ok || json?.errorCode !== 0 || !csrf || !setCookie) {
-      return { ok: false, detail: { status: r.status, body: text } };
-    }
-
-    // Pass along cookie string as-is
-    return { ok: true, csrf, cookie: setCookie };
   } catch (e) {
-    return { ok: false, detail: e.message || String(e) };
+    err('UNCAUGHT:', e?.message || e);
+    return res.status(500).json({ ok: false, error: e?.message || 'Internal error' });
   }
-}
-
-async function safeJson(req) {
-  try {
-    const buf = await getRawBody(req);
-    if (!buf || !buf.length) return {};
-    return JSON.parse(buf.toString('utf8'));
-  } catch {
-    return {};
-  }
-}
-
-// Read raw body (Vercel node runtime)
-function getRawBody(req) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    req.on('data', (c) => chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)));
-    req.on('end', () => resolve(Buffer.concat(chunks)));
-    req.on('error', reject);
-  });
 }
