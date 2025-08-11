@@ -1,138 +1,177 @@
 console.log("DEBUG: authorize.js build version 2025-08-11a");
 
+// api/authorize.js — fetch-only implementation (no axios, no cookie-jar)
+// Node 18+ on Vercel has global fetch.
+// Uses NODE_TLS_REJECT_UNAUTHORIZED=0 (set in env) to accept OC200 self-signed cert.
 
-// api/authorize.js  (Vercel Serverless Function - CommonJS with dynamic ESM import)
-const axios = require("axios").default;
-const tough = require("tough-cookie");
-const https = require("https");
-
-const BUILD_VERSION = "2025-08-11b";
-
-module.exports = async (req, res) => {
-  if (req.method !== "POST") {
-    res.status(405).json({ ok: false, error: "Use POST" });
+export default async function handler(req, res) {
+  if (req.method !== 'POST') {
+    res.status(405).json({ ok: false, error: 'Use POST' });
     return;
   }
 
-  console.log("DEBUG: authorize.js build version", BUILD_VERSION);
-
-  // 🔧 ESM-only module; load it at runtime from CommonJS:
-  let wrapper;
-  try {
-    ({ wrapper } = await import("axios-cookiejar-support"));
-  } catch (e) {
-    console.error("Failed to import axios-cookiejar-support (ESM):", e);
-    res.status(500).json({ ok: false, error: "esm_import_failed", detail: String(e) });
-    return;
-  }
-
+  const buildId = '2025-08-11c';
   try {
     const {
-      OMADA_BASE,              // e.g. https://98.114.198.237:9444  (Controller HTTPS)
-      OMADA_CONTROLLER_ID,     // default 'omadac' on OC200
+      OMADA_BASE,
       OMADA_OPERATOR_USER,
       OMADA_OPERATOR_PASS,
-      SESSION_MINUTES = "240"
+      SESSION_MINUTES = '240',
     } = process.env;
 
     if (!OMADA_BASE || !OMADA_OPERATOR_USER || !OMADA_OPERATOR_PASS) {
-      console.error("ENV MISSING", {
-        OMADA_BASE: !!OMADA_BASE,
-        OMADA_OPERATOR_USER: !!OMADA_OPERATOR_USER,
-        OMADA_OPERATOR_PASS: !!OMADA_OPERATOR_PASS
-      });
-      res.status(500).json({ ok: false, error: "Missing OMADA_* env vars" });
+      console.error('ENV MISSING', { hasBase: !!OMADA_BASE, hasUser: !!OMADA_OPERATOR_USER, hasPass: !!OMADA_OPERATOR_PASS });
+      res.status(500).json({ ok: false, error: 'Missing env vars' });
       return;
     }
 
-    const controllerId = (OMADA_CONTROLLER_ID && OMADA_CONTROLLER_ID.trim()) || "omadac";
-    const base = `${OMADA_BASE.replace(/\/$/, "")}/${controllerId}`;
+    const body = await safeJson(req);
+    const {
+      clientMac = '',
+      apMac = '',
+      ssidName = '',
+      radioId = '',
+      site = '',
+      clientIp = '',
+      redirectUrl = 'http://neverssl.com',
+      email = '',
+    } = body || {};
 
-    const { clientMac, apMac, ssidName, radioId, site, redirectUrl } = req.body || {};
+    console.log('DEBUG: authorize.js build', buildId);
+    console.log('REQUEST BODY (redacted):', {
+      clientMac, apMac, ssidName, radioId, site, clientIp,
+      redirectUrl, emailRedacted: email ? 'yes' : 'no'
+    });
+
     if (!clientMac || !site) {
-      console.error("REQUEST MISSING", { clientMac, site, body: req.body });
-      res.status(400).json({ ok: false, error: "Missing clientMac or site" });
+      res.status(400).json({ ok: false, error: 'Missing clientMac or site' });
       return;
     }
 
-    // Accept self-signed cert + keep cookies
-    const agent = new https.Agent({ rejectUnauthorized: false });
-    const jar = new tough.CookieJar();
-    const http = wrapper(axios.create({
-      jar,
-      withCredentials: true,
-      timeout: 15000,
-      httpsAgent: agent
-    }));
+    // Normalize base; try common controller prefixes in order
+    const bases = normalizeBases(OMADA_BASE);
 
-    // 1) Hotspot login -> CSRF token
-    let login;
-    try {
-      login = await http.post(`${base}/api/v2/hotspot/login`, {
-        name: OMADA_OPERATOR_USER,
-        password: OMADA_OPERATOR_PASS
-      }, {
-        headers: { "Content-Type": "application/json", "Accept": "application/json" }
-      });
-    } catch (e) {
-      const data = e?.response?.data || e.message || e;
-      console.error("LOGIN HTTP ERROR:", data);
-      res.status(502).json({ ok: false, step: "login", error: "HTTP error", detail: data });
+    // Attempt login on the first base that responds
+    let loginResult = null;
+    for (const base of bases) {
+      loginResult = await hotspotLogin(base, OMADA_OPERATOR_USER, OMADA_OPERATOR_PASS);
+      if (loginResult.ok) {
+        loginResult.base = base;
+        break;
+      }
+      console.warn('LOGIN failed on base', base, 'detail:', loginResult.detail);
+    }
+
+    if (!loginResult || !loginResult.ok) {
+      console.error('LOGIN failed on all bases');
+      res.status(502).json({ ok: false, error: 'Hotspot login failed', detail: loginResult?.detail || null });
       return;
     }
 
-    if (!login.data || login.data.errorCode !== 0) {
-      console.error("LOGIN FAILED:", login.data);
-      res.status(502).json({ ok: false, step: "login", error: "Hotspot login failed", detail: login.data });
-      return;
-    }
+    const { base: goodBase, cookie, csrf } = loginResult;
 
-    const csrf = login.data.result?.token;
-    if (!csrf) {
-      console.error("LOGIN NO TOKEN:", login.data);
-      res.status(502).json({ ok: false, step: "login", error: "No CSRF token", detail: login.data });
-      return;
-    }
-
-    // 2) Authorize client
-    const timeMicros = String(BigInt(SESSION_MINUTES) * 60n * 1000000n);
-    const payload = {
+    // Build authorization payload
+    const timeMicros = String(BigInt(SESSION_MINUTES) * 60n * 1_000_000n);
+    const authPayload = {
       clientMac,
       apMac,
       ssidName,
       radioId: radioId ? Number(radioId) : 1,
       site,
       time: timeMicros,
-      authType: 4
+      authType: 4, // external portal
     };
 
-    let auth;
-    try {
-      auth = await http.post(`${base}/api/v2/hotspot/extPortal/auth`, payload, {
-        headers: {
-          "Content-Type": "application/json",
-          "Accept": "application/json",
-          "Csrf-Token": csrf
-        }
+    const authResp = await fetch(`${goodBase}/api/v2/hotspot/extPortal/auth`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'Csrf-Token': csrf,
+        'Cookie': cookie,
+      },
+      body: JSON.stringify(authPayload),
+    });
+
+    const authText = await authResp.text();
+    let authJson = {};
+    try { authJson = JSON.parse(authText); } catch {}
+
+    if (!authResp.ok || !authJson || authJson.errorCode !== 0) {
+      console.error('AUTH failed', {
+        status: authResp.status, statusText: authResp.statusText, body: authText
       });
-    } catch (e) {
-      const data = e?.response?.data || e.message || e;
-      console.error("AUTH HTTP ERROR:", data);
-      res.status(502).json({ ok: false, step: "auth", error: "HTTP error", detail: data });
+      res.status(502).json({ ok: false, error: 'Authorization failed', detail: authJson || authText });
       return;
     }
 
-    if (!auth.data || auth.data.errorCode !== 0) {
-      console.error("AUTH FAILED:", auth.data);
-      res.status(502).json({ ok: false, step: "auth", error: "Authorization failed", detail: auth.data });
-      return;
-    }
-
-    console.log("AUTH OK:", { site, clientMac, apMac, ssidName });
-    res.json({ ok: true, redirectUrl: redirectUrl || "http://neverssl.com" });
+    console.log('AUTH OK', { base: goodBase, site, clientMac });
+    res.json({ ok: true, redirectUrl });
   } catch (err) {
-    const detail = err?.response?.data || err.message || err;
-    console.error("authorize fatal error:", detail);
-    res.status(500).json({ ok: false, error: "Internal error", detail });
+    console.error('authorize handler error:', err?.stack || err);
+    res.status(500).json({ ok: false, error: err.message || 'Internal error' });
   }
-};
+}
+
+/* ---------------------- helpers ---------------------- */
+
+function normalizeBases(raw) {
+  // Strip trailing slashes
+  const root = String(raw).replace(/\/+$/, '');
+
+  // If caller already included /omada or /omadac, try that first
+  const lower = root.toLowerCase();
+  if (lower.endsWith('/omada') || lower.endsWith('/omadac')) {
+    return [root, root.replace(/\/omadac$/i, ''), root.replace(/\/omada$/i, '')];
+  }
+
+  // Otherwise try common bases in order
+  return [`${root}/omada`, `${root}/omadac`, root];
+}
+
+async function hotspotLogin(base, name, password) {
+  try {
+    const r = await fetch(`${base}/api/v2/hotspot/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: JSON.stringify({ name, password }),
+    });
+
+    const text = await r.text();
+    let json = {};
+    try { json = JSON.parse(text); } catch {}
+
+    // Expect { errorCode: 0, result: { token: '...' } } and a Set-Cookie header
+    const csrf = json?.result?.token || '';
+    const setCookie = r.headers.get('set-cookie') || '';
+
+    if (!r.ok || json?.errorCode !== 0 || !csrf || !setCookie) {
+      return { ok: false, detail: { status: r.status, body: text } };
+    }
+
+    // Pass along cookie string as-is
+    return { ok: true, csrf, cookie: setCookie };
+  } catch (e) {
+    return { ok: false, detail: e.message || String(e) };
+  }
+}
+
+async function safeJson(req) {
+  try {
+    const buf = await getRawBody(req);
+    if (!buf || !buf.length) return {};
+    return JSON.parse(buf.toString('utf8'));
+  } catch {
+    return {};
+  }
+}
+
+// Read raw body (Vercel node runtime)
+function getRawBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)));
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
