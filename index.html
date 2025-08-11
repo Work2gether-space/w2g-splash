@@ -4,36 +4,38 @@
   <meta charset="UTF-8" />
   <title>Work2gether Login</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <link href="https://fonts.googleapis.com/css2?family=Montserrat&display=swap" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;600;700&display=swap" rel="stylesheet" />
   <style>
+    :root { --accent: #B4340E; }
+    * { box-sizing: border-box; }
     body {
       margin: 0;
       font-family: 'Montserrat', sans-serif;
       background: #fff;
       color: #000;
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      height: 100vh;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
     }
     .login-box {
       width: 320px;
       padding: 2.5rem;
       border: 1px solid #000;
-      box-sizing: border-box;
-      box-shadow: 0 0 15px rgba(180, 52, 14, 0.3);
+      box-shadow: 0 0 15px rgba(180, 52, 14, 0.25);
       border-radius: 4px;
       text-align: center;
+      background: #fff;
     }
     h2 {
-      color: #B4340E;
-      margin-bottom: 1.5rem;
+      color: var(--accent);
+      margin: 0 0 1rem 0;
       font-weight: 700;
+      font-size: 1.4rem;
     }
-    p {
-      margin-bottom: 2rem;
-      font-weight: 500;
-      font-size: 1rem;
+    p.desc {
+      margin: 0 0 1.5rem 0;
+      font-size: .95rem;
+      color: #333;
     }
     input[type="email"] {
       width: 100%;
@@ -41,9 +43,8 @@
       font-size: 1rem;
       border: 1px solid #000;
       border-radius: 0;
-      box-sizing: border-box;
-      margin-bottom: 1.5rem;
-      font-family: 'Montserrat', sans-serif;
+      margin-bottom: 1rem;
+      outline: none;
     }
     button[type="submit"] {
       width: 100%;
@@ -54,9 +55,8 @@
       background: #000;
       color: #fff;
       cursor: pointer;
-      transition: all 0.3s ease;
       border-radius: 0;
-      font-family: 'Montserrat', sans-serif;
+      transition: .25s;
     }
     button[type="submit"]:hover,
     button[type="submit"]:focus {
@@ -65,94 +65,116 @@
       color: #000;
       outline: none;
     }
-    .message { margin-top: 1.5rem; font-size: 0.9rem; font-weight: 500; color: #555; line-height: 1.3; }
-    .status { margin-top: 0.75rem; min-height: 1.2em; }
+    .message { margin-top: 1rem; font-size: .9rem; color: #555; line-height: 1.3; }
+    .status   { margin-top: .75rem; min-height: 1.2em; font-size: .92rem; }
+    .muted    { color: #777; font-size: .85rem; margin-top: .5rem; }
   </style>
 </head>
 <body>
   <form class="login-box" id="loginForm" autocomplete="on" novalidate>
     <h2>Welcome to Work2gether</h2>
-    <p>Please log in to start your session</p>
+    <p class="desc">Please log in to start your session.</p>
 
     <input type="email" id="email" name="email" placeholder="Your Email" required />
-    <button type="submit">Start Session</button>
+    <button type="submit" id="submitBtn">Start Session</button>
 
     <div class="message">
       Your time of access will determine how credits are used.<br />
       Make sure to log out if you're done.
     </div>
     <div id="status" class="status"></div>
+    <div id="debug" class="muted"></div>
   </form>
 
-<script>
-  // Build values from the portal query string
-  const q = new URLSearchParams(location.search);
+  <script>
+    // --- Read Omada portal query params ---
+    const q = new URLSearchParams(window.location.search);
 
-  // Omada usually includes these in the external portal URL:
-  // clientMac, apMac, ssidName, radioId, site, redirectUrl
-  const clientMac = q.get('clientMac') || q.get('mac') || '';
-  const apMac     = q.get('apMac')     || q.get('ap')  || '';
-  const ssidName  = q.get('ssidName')  || q.get('ssid')|| '';
-  const radioId   = q.get('radioId')   || q.get('radio')|| '';
-  const site      = q.get('site')      || '';
-  const nextUrl   = decodeURIComponent(q.get('redirectUrl') || '') || 'http://neverssl.com';
+    const portalParams = {
+      clientMac: q.get('clientMac') || q.get('mac') || '',
+      apMac:     q.get('apMac')     || '',
+      ssidName:  q.get('ssidName')  || q.get('ssid') || '',
+      radioId:   q.get('radioId')   || q.get('radio') || '',
+      site:      q.get('site')      || q.get('siteId') || ''
+    };
 
-  // keep a friendly client_id for logging if portal params are missing
-  const clientIdForLog = clientMac || q.get('clientIp') || q.get('uip') || 'manual-test';
+    const portalRedirect =
+      (q.get('redirectUrl') ? decodeURIComponent(q.get('redirectUrl')) : '') ||
+      'http://neverssl.com';
 
-  const form = document.getElementById('loginForm');
-  const statusEl = document.getElementById('status');
+    // (Optional) show minimal debug if critical fields are missing
+    (function showDebug() {
+      const debug = document.getElementById('debug');
+      const missing = [];
+      if (!portalParams.clientMac) missing.push('clientMac');
+      if (!portalParams.site)      missing.push('site');
+      if (missing.length) {
+        debug.textContent =
+          'Note: missing parameter(s) from controller: ' + missing.join(', ');
+      }
+    })();
 
-  form.addEventListener('submit', async (e) => {
-    e.preventDefault();
-    statusEl.textContent = '';
+    const form = document.getElementById('loginForm');
+    const statusEl = document.getElementById('status');
+    const submitBtn = document.getElementById('submitBtn');
 
-    const email = document.getElementById('email').value.trim();
-    if (!email) {
-      statusEl.textContent = 'Enter a valid email.';
-      statusEl.style.color = 'red';
-      return;
-    }
-
-    try {
-      // Call our backend authorizer (this talks to the OC200)
-      const res = await fetch('/api/authorize', {
+    async function postJson(url, body) {
+      const res = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          email,
-          client_id: clientIdForLog,
-          clientMac, apMac, ssidName, radioId, site,
-          redirectUrl: nextUrl
-        })
+        body: JSON.stringify(body || {})
       });
+      let data = null;
+      try { data = await res.json(); } catch (_) {}
+      return { ok: res.ok, status: res.status, data };
+    }
 
-      if (!res.ok) {
-        const t = await res.text();
-        console.error('API error:', t);
-        statusEl.textContent = 'Network/authorize error. Try again.';
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      statusEl.textContent = '';
+      statusEl.style.color = '#555';
+
+      const email = (document.getElementById('email').value || '').trim();
+      if (!email) {
+        statusEl.textContent = 'Enter a valid email.';
         statusEl.style.color = 'red';
         return;
       }
 
-      const data = await res.json();
-      if (data && data.ok) {
+      submitBtn.disabled = true;
+
+      try {
+        // 1) Optional: log the email (non-blocking)
+        postJson('/api/submit_email', { email, client_id: portalParams.clientMac }).catch(() => {});
+
+        // 2) Authorize with Omada
+        const authPayload = {
+          ...portalParams,
+          redirectUrl: portalRedirect
+        };
+
+        const auth = await postJson('/api/authorize', authPayload);
+
+        if (!auth.ok || !auth.data || !auth.data.ok) {
+          console.error('Authorize error:', auth);
+          statusEl.textContent = 'Could not authorize your session. Try again.';
+          statusEl.style.color = 'red';
+          submitBtn.disabled = false;
+          return;
+        }
+
         statusEl.textContent = 'Saved. Finishing sign-in…';
         statusEl.style.color = 'green';
-        // Prefer server-provided redirect, else the portal’s original redirectUrl
-        const go = data.redirectUrl || nextUrl;
-        setTimeout(() => { location.href = go; }, 400);
-      } else {
-        console.error('Authorize failed:', data);
-        statusEl.textContent = 'Authorization failed. Try again.';
+        const finalUrl = auth.data.redirectUrl || portalRedirect;
+        // small delay for UX
+        setTimeout(() => { window.location.href = finalUrl; }, 500);
+      } catch (err) {
+        console.error(err);
+        statusEl.textContent = 'Network error. Try again.';
         statusEl.style.color = 'red';
+        submitBtn.disabled = false;
       }
-    } catch (err) {
-      console.error(err);
-      statusEl.textContent = 'Network error. Try again.';
-      statusEl.style.color = 'red';
-    }
-  });
-</script>
+    });
+  </script>
 </body>
 </html>
