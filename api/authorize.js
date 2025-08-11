@@ -1,13 +1,12 @@
 console.log("DEBUG: authorize.js build version 2025-08-11a");
 
 
-// api/authorize.js  (Vercel Serverless Function - CommonJS)
+// api/authorize.js  (Vercel Serverless Function - CommonJS with dynamic ESM import)
 const axios = require("axios").default;
 const tough = require("tough-cookie");
-const { wrapper } = require("axios-cookiejar-support");
 const https = require("https");
 
-const BUILD_VERSION = "2025-08-11A";
+const BUILD_VERSION = "2025-08-11b";
 
 module.exports = async (req, res) => {
   if (req.method !== "POST") {
@@ -17,26 +16,38 @@ module.exports = async (req, res) => {
 
   console.log("DEBUG: authorize.js build version", BUILD_VERSION);
 
+  // 🔧 ESM-only module; load it at runtime from CommonJS:
+  let wrapper;
+  try {
+    ({ wrapper } = await import("axios-cookiejar-support"));
+  } catch (e) {
+    console.error("Failed to import axios-cookiejar-support (ESM):", e);
+    res.status(500).json({ ok: false, error: "esm_import_failed", detail: String(e) });
+    return;
+  }
+
   try {
     const {
-      OMADA_BASE,              // e.g. https://98.114.198.237:9444  (Controller HTTPS -> 443)
+      OMADA_BASE,              // e.g. https://98.114.198.237:9444  (Controller HTTPS)
       OMADA_CONTROLLER_ID,     // default 'omadac' on OC200
       OMADA_OPERATOR_USER,
       OMADA_OPERATOR_PASS,
       SESSION_MINUTES = "240"
     } = process.env;
 
-    // Validate env
     if (!OMADA_BASE || !OMADA_OPERATOR_USER || !OMADA_OPERATOR_PASS) {
-      console.error("ENV MISSING", { OMADA_BASE: !!OMADA_BASE, OMADA_OPERATOR_USER: !!OMADA_OPERATOR_USER, OMADA_OPERATOR_PASS: !!OMADA_OPERATOR_PASS });
+      console.error("ENV MISSING", {
+        OMADA_BASE: !!OMADA_BASE,
+        OMADA_OPERATOR_USER: !!OMADA_OPERATOR_USER,
+        OMADA_OPERATOR_PASS: !!OMADA_OPERATOR_PASS
+      });
       res.status(500).json({ ok: false, error: "Missing OMADA_* env vars" });
       return;
     }
 
-    const controllerId = OMADA_CONTROLLER_ID && OMADA_CONTROLLER_ID.trim() ? OMADA_CONTROLLER_ID.trim() : "omadac";
+    const controllerId = (OMADA_CONTROLLER_ID && OMADA_CONTROLLER_ID.trim()) || "omadac";
     const base = `${OMADA_BASE.replace(/\/$/, "")}/${controllerId}`;
 
-    // Read request from splash page
     const { clientMac, apMac, ssidName, radioId, site, redirectUrl } = req.body || {};
     if (!clientMac || !site) {
       console.error("REQUEST MISSING", { clientMac, site, body: req.body });
@@ -44,10 +55,15 @@ module.exports = async (req, res) => {
       return;
     }
 
-    // Accept OC200 self-signed cert AND keep cookie jar
+    // Accept self-signed cert + keep cookies
     const agent = new https.Agent({ rejectUnauthorized: false });
     const jar = new tough.CookieJar();
-    const http = wrapper(axios.create({ jar, withCredentials: true, timeout: 15000, httpsAgent: agent }));
+    const http = wrapper(axios.create({
+      jar,
+      withCredentials: true,
+      timeout: 15000,
+      httpsAgent: agent
+    }));
 
     // 1) Hotspot login -> CSRF token
     let login;
@@ -78,7 +94,7 @@ module.exports = async (req, res) => {
       return;
     }
 
-    // 2) Authorize client (time is microseconds)
+    // 2) Authorize client
     const timeMicros = String(BigInt(SESSION_MINUTES) * 60n * 1000000n);
     const payload = {
       clientMac,
