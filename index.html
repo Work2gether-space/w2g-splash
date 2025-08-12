@@ -145,9 +145,22 @@
       try {
         $btn.disabled = true;
 
-        // 1) fire and forget email capture
+        // 1) email capture  send full payload
         try {
-          const r1 = await postJSON('/api/submit_email', { email, client_id: portalParams.clientMac || 'manual' });
+          const capture = {
+            email,
+            client_id: portalParams.clientMac || 'manual',
+            clientMac: portalParams.clientMac,
+            apMac: portalParams.apMac,
+            ssidName: portalParams.ssidName,
+            radioId: portalParams.radioId,
+            site: portalParams.site,
+            clientIp: portalParams.clientIp,
+            redirectUrl: portalParams.redirectUrl,
+            time: DEFAULT_TIME,
+            authType: DEFAULT_AUTH_TYPE
+          };
+          const r1 = await postJSON('/api/submit_email', capture);
           if (DEBUG) console.log('[splash] submit_email', r1.res.status, r1.text);
         } catch (err) {
           if (DEBUG) console.warn('[splash] submit_email failed', err);
@@ -184,4 +197,3 @@
   </script>
 </body>
 </html>
-
