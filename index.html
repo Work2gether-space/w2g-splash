@@ -1,51 +1,102 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
+  <meta charset="UTF-8">
   <title>Work2gether Login</title>
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
-    *{box-sizing:border-box}
-    body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;font:16px system-ui,Arial,sans-serif;background:#fff;color:#111}
-    .card{width:320px;padding:24px;border:1px solid #111;background:#fff}
-    h1{font-size:18px;margin:0 0 4px}
-    p{margin:0 0 16px}
-    input,button{width:100%;padding:10px 12px;font:inherit}
-    input{border:1px solid #111;margin:8px 0 12px}
-    button{border:0;background:#111;color:#fff;font-weight:700;cursor:pointer}
-    .status{min-height:1.2em;margin-top:8px;font-size:14px}
+    body {
+      font-family: sans-serif;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      height: 100vh;
+      background: #fff;
+    }
+    .card {
+      border: 1px solid #ccc;
+      padding: 2rem;
+      border-radius: 10px;
+      box-shadow: 0 0 15px rgba(0,0,0,0.1);
+      text-align: center;
+      max-width: 400px;
+      width: 90%;
+    }
+    .card h1 {
+      color: #b03b1c;
+      margin-bottom: 1rem;
+    }
+    .card input {
+      width: 100%;
+      padding: 0.75rem;
+      margin-bottom: 1rem;
+      border: 1px solid #aaa;
+      border-radius: 5px;
+    }
+    .card button {
+      padding: 0.75rem 1.5rem;
+      border: 1px solid #000;
+      background: #fff;
+      cursor: pointer;
+      font-weight: bold;
+      border-radius: 5px;
+    }
+    .card .info {
+      margin-top: 1rem;
+      font-size: 0.9rem;
+      color: #555;
+    }
+    .error {
+      color: red;
+      margin-top: 0.75rem;
+    }
   </style>
 </head>
 <body>
-  <main class="card">
+  <div class="card">
     <h1>Welcome to Work2gether</h1>
     <p>Please log in to start your session</p>
-
-    <form id="form" novalidate>
-      <input type="email" id="email" name="email" placeholder="Your email" autocomplete="email" required />
-      <button type="submit">Continue</button>
-      <div id="status" class="status" aria-live="polite"></div>
+    <form id="loginForm">
+      <input type="email" id="email" placeholder="you@example.com" required />
+      <button type="submit">Start Session</button>
     </form>
-  </main>
+    <div class="info">
+      Your time of access will determine how credits are used.<br>
+      Make sure to log out if you're done.
+    </div>
+    <div class="error" id="error"></div>
+  </div>
 
   <script>
-    // Show we received Omada query params. Never blocks render.
-    const qs = new URLSearchParams(location.search);
-    const haveParams = !!(qs.get('clientMac') && qs.get('site'));
-    console.log('[splash] params present:', haveParams, Object.fromEntries(qs.entries()));
+    const q = new URLSearchParams(location.search);
+    const clientMac = q.get("clientMac") || "";
+    const redirectUrl = decodeURIComponent(q.get("redirectUrl") || "") || "http://neverssl.com";
+    
+    const form = document.getElementById("loginForm");
+    const errorDiv = document.getElementById("error");
 
-    const form = document.getElementById('form');
-    const statusEl = document.getElementById('status');
-
-    form.addEventListener('submit', (e) => {
+    form.addEventListener("submit", async (e) => {
       e.preventDefault();
-      const email = document.getElementById('email').value.trim();
-      if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-        statusEl.textContent = 'Enter a valid email';
-        return;
+      const email = document.getElementById("email").value;
+
+      try {
+        const res = await fetch("/submit_email", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({ client_id: clientMac, email })
+        });
+
+        const data = await res.json();
+        if (res.ok) {
+          location.href = redirectUrl;
+        } else {
+          errorDiv.textContent = data.error || "Network error. Try again.";
+        }
+      } catch (err) {
+        errorDiv.textContent = "Network error. Try again.";
       }
-      // For rollback, we do not call any API. Just confirm submit.
-      statusEl.textContent = 'Thanks. You can close this window.';
     });
   </script>
 </body>
