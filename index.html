@@ -1,17 +1,21 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
+  <meta charset="UTF-8" />
   <title>Work2gether Login</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- Montserrat font -->
+  <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;600&display=swap" rel="stylesheet">
   <style>
     body {
-      font-family: sans-serif;
+      font-family: 'Montserrat', sans-serif;
       display: flex;
       justify-content: center;
       align-items: center;
       height: 100vh;
       background: #fff;
+      margin: 0;
+      padding: 1rem;
     }
     .card {
       border: 1px solid #ccc;
@@ -19,12 +23,14 @@
       border-radius: 10px;
       box-shadow: 0 0 15px rgba(0,0,0,0.1);
       text-align: center;
+      width: 100%;
       max-width: 400px;
-      width: 90%;
+      background: #fff;
     }
     .card h1 {
       color: #b03b1c;
       margin-bottom: 1rem;
+      font-size: 1.5rem;
     }
     .card input {
       width: 100%;
@@ -32,23 +38,33 @@
       margin-bottom: 1rem;
       border: 1px solid #aaa;
       border-radius: 5px;
+      font-size: 1rem;
     }
     .card button {
-      padding: 0.75rem 1.5rem;
-      border: 1px solid #000;
-      background: #fff;
+      width: 100%;
+      padding: 0.75rem;
+      border: none;
+      background: #b03b1c;
+      color: #fff;
+      font-weight: 600;
+      font-size: 1rem;
       cursor: pointer;
-      font-weight: bold;
       border-radius: 5px;
+      transition: background 0.2s;
+    }
+    .card button:hover {
+      background: #922f15;
     }
     .card .info {
       margin-top: 1rem;
-      font-size: 0.9rem;
+      font-size: 0.85rem;
       color: #555;
+      line-height: 1.4;
     }
     .error {
       color: red;
       margin-top: 0.75rem;
+      font-size: 0.9rem;
     }
   </style>
 </head>
@@ -67,67 +83,62 @@
     <div class="error" id="error"></div>
   </div>
 
-<script>
-  const qs = new URLSearchParams(location.search);
+  <script>
+    const qs = new URLSearchParams(location.search);
 
-  function safeRedirect() {
-    const r = qs.get('redirectUrl');
-    try { return r ? decodeURIComponent(r) : 'http://neverssl.com'; } catch { return 'http://neverssl.com'; }
-  }
+    function safeRedirect() {
+      const r = qs.get('redirectUrl');
+      try { return r ? decodeURIComponent(r) : 'http://neverssl.com'; } catch { return 'http://neverssl.com'; }
+    }
 
-  const form = document.getElementById("loginForm");
-  const errorDiv = document.getElementById("error");
+    const form = document.getElementById("loginForm");
+    const errorDiv = document.getElementById("error");
 
-  form.addEventListener("submit", async (e) => {
-    e.preventDefault();
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
 
-    const email = document.getElementById("email").value.trim();
+      const email = document.getElementById("email").value.trim();
 
-    // collect Omada params from the URL
-    const payload = {
-      email,
-      clientMac: qs.get("clientMac") || "",
-      apMac: qs.get("apMac") || "",
-      ssidName: qs.get("ssidName") || "",
-      radioId: qs.get("radioId") || "",
-      site: qs.get("site") || "",
-      redirectUrl: safeRedirect()
-    };
-
-    try {
-      // FIX: post to the API route
-      const res = await fetch("/api/submit_email", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
-      });
-
-      const text = await res.text();
-      if (!res.ok) {
-        try {
-          const data = JSON.parse(text);
-          errorDiv.textContent = data.error || "Authorize failed. Try again.";
-        } catch {
-          errorDiv.textContent = "Authorize failed. Try again.";
-        }
-        return;
-      }
+      const payload = {
+        email,
+        clientMac: qs.get("clientMac") || "",
+        apMac: qs.get("apMac") || "",
+        ssidName: qs.get("ssidName") || "",
+        radioId: qs.get("radioId") || "",
+        site: qs.get("site") || "",
+        redirectUrl: safeRedirect()
+      };
 
       try {
-        const data = JSON.parse(text);
-        if (data.redirectUrl) location.href = data.redirectUrl;
-        else location.href = payload.redirectUrl;
-      } catch {
-        location.href = payload.redirectUrl;
+        const res = await fetch("/api/submit_email", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+
+        const text = await res.text();
+        if (!res.ok) {
+          try {
+            const data = JSON.parse(text);
+            errorDiv.textContent = data.error || "Authorize failed. Try again.";
+          } catch {
+            errorDiv.textContent = "Authorize failed. Try again.";
+          }
+          return;
+        }
+
+        try {
+          const data = JSON.parse(text);
+          if (data.redirectUrl) location.href = data.redirectUrl;
+          else location.href = payload.redirectUrl;
+        } catch {
+          location.href = payload.redirectUrl;
+        }
+      } catch (err) {
+        console.error("[SPLASH] submit error", err);
+        errorDiv.textContent = "Network error. Try again.";
       }
-    } catch (err) {
-      console.error("[SPLASH] submit error", err);
-      errorDiv.textContent = "Network error. Try again.";
-    }
-  });
-</script>
-
-
-
+    });
+  </script>
 </body>
 </html>
