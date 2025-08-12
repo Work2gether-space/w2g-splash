@@ -1,117 +1,150 @@
 console.log("DEBUG: authorize.js build version 2025-08-11a");
 
-// api/authorize.js  (Vercel Serverless Function - CommonJS)
-const axios = require("axios").default;
-const { CookieJar } = require("tough-cookie");
-const { wrapper } = require("axios-cookiejar-support");
-const https = require("https");
+console.log("DEBUG: authorize.js build version 2025-08-11a");
 
-module.exports = async (req, res) => {
-  if (req.method !== "POST") {
-    res.status(405).json({ ok: false, error: "Use POST" });
-    return;
+// api/authorize.js  (Vercel, Node 18+; axios only, manual cookie forwarding)
+
+export default async function handler(req, res) {
+  const rid = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+  const log = (...a) => console.log(`[authorize][${rid}]`, ...a);
+  const err = (...a) => console.error(`[authorize][${rid}]`, ...a);
+
+  if (req.method !== 'POST') {
+    return res.status(405).json({ ok: false, error: 'Use POST' });
   }
 
-  // Required env
-  const {
-    OMADA_BASE,              // e.g. https://98.114.198.237:9443  public controller URL that shows the Omada login page
-    OMADA_CONTROLLER_ID,     // 32 char controller id, e.g. fc2b25d44a950a6357313da0afb4c14a
-    OMADA_OPERATOR_USER,     // operator username
-    OMADA_OPERATOR_PASS,     // operator password
-    SESSION_MINUTES = "1440" // default 24 hours
-  } = process.env;
+  // --- dynamic imports so we stay ESM-friendly on Vercel Node 18 ---
+  const axios = (await import('axios')).default;
+  const https = await import('https');
 
-  if (!OMADA_BASE || !OMADA_CONTROLLER_ID || !OMADA_OPERATOR_USER || !OMADA_OPERATOR_PASS) {
-    res.status(500).json({ ok: false, error: "Missing env vars OMADA_BASE, OMADA_CONTROLLER_ID, OMADA_OPERATOR_USER, OMADA_OPERATOR_PASS" });
-    return;
-  }
-
-  const { clientMac, apMac, ssidName, radioId, site, redirectUrl } = req.body || {};
-  if (!clientMac || !site) {
-    res.status(400).json({ ok: false, error: "Missing clientMac or site" });
-    return;
-  }
-
-  const norm = (s) => s.replace(/\/+$/,"");
-  const BASE = norm(OMADA_BASE);
-  const CONTROLLER_ID = OMADA_CONTROLLER_ID;
-
-  const LOGIN_URL = `${BASE}/${CONTROLLER_ID}/api/v2/hotspot/login`;
-  const AUTH_URL  = `${BASE}/${CONTROLLER_ID}/api/v2/hotspot/extPortal/auth`;
-
-  const agent = new https.Agent({ rejectUnauthorized: false }); // accept self-signed
-  const jar = new CookieJar();
-  const http = wrapper(axios.create({
-    jar,
-    withCredentials: true,
-    timeout: 12000,
-    httpsAgent: agent,
-    headers: { "Accept": "application/json", "Content-Type": "application/json" }
-  }));
-
-  // loud logs
-  console.info("[authorize] LOGIN try:", LOGIN_URL);
-
-  // 1) Login to hotspot to obtain CSRF token and cookies
-  let csrf = null;
   try {
-    // Omada expects username and password keys
-    const r = await http.post(LOGIN_URL, {
-      username: OMADA_OPERATOR_USER,
-      password: OMADA_OPERATOR_PASS
+    const {
+      OMADA_BASE,            // e.g. https://98.114.198.237:9444  (public IP + exposed management port)
+      OMADA_OPERATOR_USER,   // hotspot operator username
+      OMADA_OPERATOR_PASS,   // hotspot operator password
+      SESSION_MINUTES = '240'
+    } = process.env;
+
+    if (!OMADA_BASE || !OMADA_OPERATOR_USER || !OMADA_OPERATOR_PASS) {
+      err('Missing env vars. Need OMADA_BASE, OMADA_OPERATOR_USER, OMADA_OPERATOR_PASS.');
+      return res.status(500).json({ ok: false, error: 'Missing env vars.' });
+    }
+
+    const base = OMADA_BASE.replace(/\/+$/, '');
+    const body = (req.body && typeof req.body === 'object') ? req.body : {};
+
+    const clientMac   = body.clientMac || body.client_id || '';
+    const apMac       = body.apMac || '';
+    const ssidName    = body.ssidName || body.ssid || '';
+    const radioIdRaw  = body.radioId || body.radio || '';
+    const site        = body.site || '';
+    const redirectUrl = body.redirectUrl || 'http://neverssl.com';
+
+    log('REQUEST BODY (redacted):', {
+      clientMac: clientMac ? '(present)' : '',
+      apMac:     apMac ? '(present)' : '',
+      ssidName:  ssidName || '',
+      radioId:   radioIdRaw || '',
+      site:      site || '',
+      redirectUrl
     });
 
-    // Try header first, then body token
-    csrf =
-      r.headers?.["csrf-token"] ||
-      r.headers?.["Csrf-Token"] ||
-      r.data?.result?.token ||
-      null;
-
-    if (!csrf) {
-      console.error("[authorize] LOGIN ok but no CSRF token found. Resp keys:", Object.keys(r.headers || {}), Object.keys(r.data || {}));
-      res.status(502).json({ ok: false, error: "Login returned no CSRF token" });
-      return;
+    if (!clientMac || !site) {
+      err('Missing required fields: clientMac or site.');
+      return res.status(400).json({
+        ok: false,
+        error: 'Missing clientMac or site from splash redirect.'
+      });
     }
-  } catch (e) {
-    const detail = e?.response?.data || e?.message || "unknown";
-    console.error("[authorize] LOGIN failed detail:", detail);
-    res.status(502).json({ ok: false, error: "Hotspot login failed", detail });
-    return;
-  }
 
-  // 2) Authorize client
-  try {
-    const timeMs = String(parseInt(SESSION_MINUTES, 10) * 60 * 1000); // milliseconds
+    // Create axios client that accepts self-signed cert (also keep NODE_TLS_REJECT_UNAUTHORIZED=0 in env).
+    const http = axios.create({
+      timeout: 15000,
+      httpsAgent: new https.Agent({ rejectUnauthorized: false })
+    });
+
+    // Helper that posts JSON and returns { data, cookies[] }.
+    const postJson = async (url, json, headers = {}) => {
+      const resp = await http.post(url, json, {
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', ...headers },
+        validateStatus: () => true // we handle status ourselves
+      });
+      const cookies = resp.headers?.['set-cookie'] || [];
+      return { data: resp.data, status: resp.status, cookies };
+    };
+
+    // Try login on likely path prefixes.
+    const prefixes = ['', '/omada', '/omadac'];
+    let csrf = null;
+    let apiPrefix = null;
+    let cookieJar = [];
+    const loginPayload = { name: OMADA_OPERATOR_USER, password: OMADA_OPERATOR_PASS };
+
+    for (const p of prefixes) {
+      const loginUrl = `${base}${p}/api/v2/hotspot/login`;
+      log('LOGIN try:', loginUrl);
+
+      try {
+        const { data, status, cookies } = await postJson(loginUrl, loginPayload);
+        if (status !== 200) {
+          err('LOGIN HTTP status', status, 'on', loginUrl, 'resp:', JSON.stringify(data));
+          continue;
+        }
+        if (data?.errorCode === 0 && data?.result?.token) {
+          csrf = data.result.token;
+          apiPrefix = p;
+          cookieJar = cookies; // store Set-Cookie array
+          log('LOGIN success on', loginUrl, 'cookies:', cookieJar.length);
+          break;
+        } else {
+          err('LOGIN failed on', loginUrl, 'detail:', JSON.stringify(data));
+        }
+      } catch (e) {
+        err('LOGIN exception on', loginUrl, e?.message || e);
+      }
+    }
+
+    if (!csrf || apiPrefix === null) {
+      err('LOGIN failed on all bases. Tried paths:', prefixes.join(', '));
+      return res.status(502).json({ ok: false, error: 'Login failed on all bases.' });
+    }
+
+    // Build Cookie header for next request.
+    const cookieHeader = cookieJar.length ? { Cookie: cookieJar.join('; ') } : {};
+
+    // Authorize
+    const timeMicros = String(BigInt(SESSION_MINUTES) * 60n * 1000000n);
     const payload = {
       clientMac,
       apMac,
       ssidName,
-      radioId: radioId ? Number(radioId) : 1,
+      radioId: radioIdRaw ? Number(radioIdRaw) : 1,
       site,
-      time: timeMs,
+      time: timeMicros,
       authType: 4
     };
 
-    console.info("[authorize] AUTH try:", AUTH_URL, "payload:", { ...payload, clientMac: "(present)", apMac: "(present)" });
-
-    const auth = await http.post(AUTH_URL, payload, {
-      headers: {
-        "Csrf-Token": csrf
-      }
+    const authUrl = `${base}${apiPrefix}/api/v2/hotspot/extPortal/auth`;
+    log('AUTHORIZE POST ->', authUrl, 'payload:', {
+      clientMac, apMac, ssidName, radioId: payload.radioId, site, time: String(timeMicros)
     });
 
-    if (auth?.data?.errorCode !== 0) {
-      console.error("[authorize] AUTH failed:", auth?.data);
-      res.status(502).json({ ok: false, error: "Authorization failed", detail: auth?.data });
-      return;
+    const { data: authData, status: authStatus } = await postJson(
+      authUrl,
+      payload,
+      { 'Csrf-Token': csrf, ...cookieHeader }
+    );
+
+    if (authStatus === 200 && authData?.errorCode === 0) {
+      log('AUTH success -> redirect', redirectUrl);
+      return res.status(200).json({ ok: true, redirectUrl });
     }
 
-    res.json({ ok: true, redirectUrl: redirectUrl || "http://neverssl.com" });
-  } catch (e) {
-    const detail = e?.response?.data || e?.message || "unknown";
-    console.error("[authorize] AUTH error:", detail);
-    res.status(500).json({ ok: false, error: e?.message || "Internal error", detail });
-  }
-};
+    err('AUTH failed status', authStatus, 'detail:', JSON.stringify(authData));
+    return res.status(502).json({ ok: false, error: 'Authorization failed', detail: authData });
 
+  } catch (e) {
+    err('UNCAUGHT', e?.message || e);
+    return res.status(500).json({ ok: false, error: e?.message || 'Internal error' });
+  }
+}
