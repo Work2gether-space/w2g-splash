@@ -73,7 +73,7 @@ export default async function handler(req, res) {
 
   // 1) login
   log('LOGIN try:', LOGIN_URL);
-  const loginPayload = { username: OMADA_OPERATOR_USER, password: OMADA_OPERATOR_PASS };
+  const loginPayload = { name: OMADA_OPERATOR_USER, password: OMADA_OPERATOR_PASS };
 
   const { data: loginData, status: loginStatus, cookies: loginCookies, headers: loginHeaders } =
     await postJson(LOGIN_URL, loginPayload);
