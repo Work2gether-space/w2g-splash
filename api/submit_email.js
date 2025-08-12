@@ -1,18 +1,14 @@
-// api/submit_email.js  rollback minimal
+// api/submit_email.js  (Vercel Serverless Function - CommonJS)
 module.exports = async (req, res) => {
+  if (req.method !== 'POST') {
+    return res.status(405).json({ ok: false, error: 'Use POST' });
+  }
   try {
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  } catch {}
-  if (req.method === 'OPTIONS') return res.status(204).end();
-  if (req.method !== 'POST') return res.status(405).json({ ok: false, error: 'Use POST' });
-
-  try {
-    const body = req.body && typeof req.body === 'object' ? req.body : {};
-    console.log('[submit_email]', { email: body.email, clientMac: body.clientMac, site: body.site });
+    const { email, client_id } = req.body || {};
+    console.log('Email capture:', { email, client_id, ua: req.headers['user-agent'] });
     return res.status(200).json({ ok: true });
-  } catch (e) {
-    console.error('[submit_email] error', e);
+  } catch (err) {
+    console.error('submit_email error:', err);
     return res.status(500).json({ ok: false, error: 'Server error' });
   }
 };
