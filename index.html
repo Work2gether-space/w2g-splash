@@ -13,18 +13,18 @@
       font-family:'Montserrat',system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; background:var(--bg); color:var(--ink);
     }
     .card {
-      width: 320px; padding: 2.25rem; border:1px solid var(--ink); border-radius:4px;
+      width:320px; padding:2.25rem; border:1px solid var(--ink); border-radius:4px;
       box-shadow:0 0 15px rgba(180,52,14,.25); text-align:center; background:#fff;
     }
     h1 { font-size:1.15rem; margin:0 0 .25rem; color:var(--accent); font-weight:700; }
     h2 { font-size:.95rem; margin:0 0 1rem; font-weight:600; }
     input[type="email"] {
-      width:100%; padding:.75rem 1rem; border:1px solid #000; border-radius:0; margin:.5rem 0 1rem;
-      font:inherit;
+      width:100%; padding:.75rem 1rem; border:1px solid #000; border-radius:0; margin:.5rem 0 1rem; font:inherit;
     }
     button {
       width:100%; padding:.75rem 1rem; border:0; background:#000; color:#fff; font-weight:700; cursor:pointer;
     }
+    button[disabled] { opacity:.6; cursor:not-allowed; }
     button:hover, button:focus { outline:0; background:#fff; color:#000; border:1px solid #000; }
     .fine { margin-top:1rem; font-size:.82rem; color:#555; line-height:1.25; }
     .status { min-height:1.2em; margin-top:.75rem; font-size:.9rem; }
@@ -43,44 +43,48 @@
 
     <form id="form" novalidate>
       <input type="email" id="email" name="email" placeholder="Your Email" autocomplete="email" required />
-      <button type="submit">Start Session</button>
-      <div id="status" class="status"></div>
+      <button id="submitBtn" type="submit">Start Session</button>
+      <div id="status" class="status" aria-live="polite"></div>
     </form>
 
     <p class="fine">
       Your time of access will determine how credits are used.
-      Make sure to log out if you're done.
+      Make sure to log out if you are done.
     </p>
 
     <details id="dbgWrap" class="debug">
-      <summary>Debug (payload & URL params)</summary>
+      <summary>Debug (payload and URL params)</summary>
       <pre id="debugBox"></pre>
     </details>
   </main>
 
   <script>
-    // --- Helpers -------------------------------------------------------------
+    // Helpers
     const qs = new URLSearchParams(location.search);
 
-    // Pull Omada params (names seen across OC200/SDN variants)
+    // Pull Omada params
     const portalParams = {
-      clientMac : qs.get('clientMac') || qs.get('mac') || '',
-      apMac     : qs.get('apMac')     || '',
-      ssidName  : qs.get('ssidName')  || qs.get('ssid') || '',
-      radioId   : qs.get('radioId')   || qs.get('radio') || '',
-      site      : qs.get('site')      || '',
-      clientIp  : qs.get('clientIp')  || qs.get('uip') || '',
-      // Omada typically includes redirectUrl; fall back to neverssl
+      clientMac  : qs.get('clientMac') || qs.get('mac') || '',
+      apMac      : qs.get('apMac') || '',
+      ssidName   : qs.get('ssidName') || qs.get('ssid') || '',
+      radioId    : qs.get('radioId') || qs.get('radio') || '',
+      site       : qs.get('site') || '',
+      clientIp   : qs.get('clientIp') || qs.get('uip') || '',
       redirectUrl: decodeURIComponent(qs.get('redirectUrl') || '') || 'http://neverssl.com'
     };
 
-    // Optional debug mode: add ?debug=1 to the splash URL
+    // Defaults the API may use
+    const DEFAULT_TIME = 86400000;
+    const DEFAULT_AUTH_TYPE = 4;
+
+    // Optional debug
     const DEBUG = qs.get('debug') === '1';
 
-    const $form   = document.getElementById('form');
+    const $form = document.getElementById('form');
+    const $btn  = document.getElementById('submitBtn');
     const $status = document.getElementById('status');
-    const $dbg    = document.getElementById('dbgWrap');
-    const $box    = document.getElementById('debugBox');
+    const $dbg = document.getElementById('dbgWrap');
+    const $box = document.getElementById('debugBox');
 
     if (DEBUG) {
       $dbg.style.display = 'block';
@@ -97,6 +101,10 @@
       $status.textContent = msg || '';
     }
 
+    function isValidEmail(s) {
+      return typeof s === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s);
+    }
+
     async function postJSON(url, body) {
       const res = await fetch(url, {
         method: 'POST',
@@ -106,27 +114,27 @@
       return { res, text: await res.text() };
     }
 
-    // --- Submit flow ---------------------------------------------------------
     $form.addEventListener('submit', async (e) => {
       e.preventDefault();
       setStatus('');
-
       const email = document.getElementById('email').value.trim();
-      if (!email) {
+
+      if (!isValidEmail(email)) {
         setStatus('Enter a valid email.', 'err');
         return;
       }
 
-      // Build payload sent to both endpoints
       const payload = {
         email,
-        clientMac : portalParams.clientMac,
-        apMac     : portalParams.apMac,
-        ssidName  : portalParams.ssidName,
-        radioId   : portalParams.radioId,
-        site      : portalParams.site,
-        clientIp  : portalParams.clientIp,
-        redirectUrl: portalParams.redirectUrl
+        clientMac  : portalParams.clientMac,
+        apMac      : portalParams.apMac,
+        ssidName   : portalParams.ssidName,
+        radioId    : portalParams.radioId,
+        site       : portalParams.site,
+        clientIp   : portalParams.clientIp,
+        redirectUrl: portalParams.redirectUrl,
+        time       : DEFAULT_TIME,
+        authType   : DEFAULT_AUTH_TYPE
       };
 
       if (DEBUG) {
@@ -135,7 +143,9 @@
       }
 
       try {
-        // 1) Optional: record the email (non-blocking if it fails)
+        $btn.disabled = true;
+
+        // 1) fire and forget email capture
         try {
           const r1 = await postJSON('/api/submit_email', { email, client_id: portalParams.clientMac || 'manual' });
           if (DEBUG) console.log('[splash] submit_email', r1.res.status, r1.text);
@@ -143,7 +153,7 @@
           if (DEBUG) console.warn('[splash] submit_email failed', err);
         }
 
-        // 2) Ask Vercel function to authorize on Omada
+        // 2) authorize with controller
         setStatus('Authorizing…');
         const { res, text } = await postJSON('/api/authorize', payload);
 
@@ -154,24 +164,24 @@
         }
 
         let data = {};
-        try { data = JSON.parse(text); } catch { data = {}; }
+        try { data = JSON.parse(text); } catch {}
         if (DEBUG) console.log('[splash] /api/authorize ok', data);
 
-        setStatus('Authorized. Finishing sign-in…', 'ok');
-
-        // Use redirectUrl from API (if returned) or the one from Omada/fallback
+        setStatus('Authorized. Finishing sign in…', 'ok');
         const next = (data && data.redirectUrl) || portalParams.redirectUrl || 'http://neverssl.com';
         setTimeout(() => { location.href = next; }, 400);
       } catch (err) {
         if (DEBUG) console.error('[splash] fatal', err);
         setStatus('Network error. Try again.', 'err');
+      } finally {
+        $btn.disabled = false;
       }
     });
 
-    // If Omada didn’t supply params, surface that in debug (helps on manual tests)
     if (DEBUG && (!portalParams.clientMac || !portalParams.site)) {
       $box.textContent += '\n\nWARNING: Missing clientMac or site from URL. The controller may reject authorization.';
     }
   </script>
 </body>
 </html>
+
