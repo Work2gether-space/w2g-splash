@@ -4,8 +4,7 @@
   <meta charset="UTF-8" />
   <title>Work2gether Login</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <!-- Montserrat font -->
-  <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;600&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400&display=swap" rel="stylesheet">
   <style>
     html, body {
       height: 100%;
@@ -22,7 +21,7 @@
     }
     .card {
       border: 1px solid #ccc;
-      padding: 2rem;
+      padding: 2rem;                /* equal padding all sides */
       border-radius: 10px;
       box-shadow: 0 0 15px rgba(0,0,0,0.1);
       text-align: center;
@@ -36,49 +35,52 @@
       color: #b03b1c;
       margin-bottom: 1rem;
       font-size: 1.5rem;
+      font-weight: 400;             /* normal weight */
     }
     .card p {
       margin-bottom: 1rem;
+      font-weight: 400;             /* normal weight */
     }
     .card input {
       width: 100%;
-      padding: 0.75rem;
+      padding: 0.75rem;             /* equal left and right padding */
       margin-bottom: 1rem;
       border: 1px solid #aaa;
       border-radius: 5px;
       font-size: 1rem;
+      font-weight: 400;             /* normal weight */
     }
     .card button {
       width: 100%;
-      padding: 0.75rem;
-      border: none;
-      background: #b03b1c;
+      padding: 0.75rem;             /* equal left and right padding */
+      background: #000;             /* black default */
       color: #fff;
-      font-weight: 600;
       font-size: 1rem;
+      font-weight: 400;             /* Montserrat normal */
       cursor: pointer;
-      border-radius: 5px;
-      transition: background 0.2s;
+      border: 1px solid #000;       /* thin black outline */
+      border-radius: 0;             /* square corners */
+      transition: background 0.2s, color 0.2s;
     }
     .card button:hover {
-      background: #922f15;
+      background: transparent;      /* transparent on hover */
+      color: #000;                  /* text switches to black */
     }
     .card .info {
       margin-top: 1rem;
       font-size: 0.85rem;
       color: #555;
       line-height: 1.4;
+      font-weight: 400;
     }
     .error {
       color: red;
       margin-top: 0.75rem;
       font-size: 0.9rem;
+      font-weight: 400;
     }
     @media (max-height: 500px) {
-      body {
-        align-items: flex-start;
-        padding-top: 2rem;
-      }
+      body { align-items: flex-start; padding-top: 2rem; }
     }
   </style>
 </head>
@@ -156,4 +158,5 @@
   </script>
 </body>
 </html>
+
 
