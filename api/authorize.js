@@ -1,7 +1,5 @@
 console.log("DEBUG: authorize.js build version 2025-08-11a");
 
-console.log("DEBUG: authorize.js build version 2025-08-11a");
-
 // api/authorize.js  (Vercel, Node 18+; axios only, manual cookie forwarding)
 
 export default async function handler(req, res) {
