@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Work2gether Login</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400&display=swap" rel="stylesheet">
+  <style>
+    /* Make width calculations include padding and border so 100% fits cleanly */
+    *, *::before, *::after { box-sizing: border-box; }
+
+    html, body {
+      height: 100%;
+      margin: 0;
+      padding: 0;
+      font-family: 'Montserrat', sans-serif;
+      background: #fff;
+    }
+    body {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      padding: 1rem;
+    }
+    .card {
+      border: 1px solid #ccc;
+      padding: 2rem;
+      border-radius: 10px;
+      box-shadow: 0 0 15px rgba(0,0,0,0.1);
+      text-align: center;
+      width: 100%;
+      max-width: 400px;
+      background: #fff;
+      display: flex;
+      flex-direction: column;
+    }
+    .card h1 {
+      color: #b03b1c;
+      margin-bottom: 1rem;
+      font-size: 1.5rem;
+      font-weight: 400;
+    }
+    .card p {
+      margin-bottom: 1rem;
+      font-weight: 400;
+    }
+    form { margin: 0; }
+
+    .card input {
+      display: block;
+      width: 100%;
+      padding: 0.75rem;
+      margin-bottom: 1rem;
+      border: 1px solid #aaa;
+      border-radius: 5px;
+      font-size: 1rem;
+      font-weight: 400;
+    }
+    .card button {
+      display: block;
+      width: 100%;
+      padding: 0.75rem;
+      background: #000;
+      color: #fff;
+      font-size: 1rem;
+      font-weight: 400;
+      cursor: pointer;
+      border: 1px solid #000;
+      border-radius: 0;
+      transition: background 0.2s, color 0.2s;
+    }
+    .card button:hover {
+      background: transparent;
+      color: #000;
+    }
+    .card .info {
+      margin-top: 1rem;
+      font-size: 0.85rem;
+      color: #555;
+      line-height: 1.4;
+      font-weight: 400;
+    }
+    .error {
+      color: red;
+      margin-top: 0.75rem;
+      font-size: 0.9rem;
+      font-weight: 400;
+      min-height: 1.2em; /* keeps layout steady when errors appear */
+    }
+    @media (max-height: 500px) {
+      body { align-items: flex-start; padding-top: 2rem; }
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Welcome to Work2gether</h1>
+    <p>Please log in to start your session</p>
+
+    <form id="loginForm" novalidate>
+      <input type="email" id="email" placeholder="you@example.com" autocomplete="email" required />
+      <button type="submit">Start Session</button>
+    </form>
+
+    <div class="info">
+      Your time of access will determine how credits are used.<br>
+      Make sure to log out if you're done.
+    </div>
+    <div class="error" id="error" role="alert" aria-live="polite"></div>
+  </div>
+
+  <script>
+    const qs = new URLSearchParams(location.search);
+
+    function safeRedirect() {
+      const r = qs.get('redirectUrl');
+      try { return r ? decodeURIComponent(r) : 'http://neverssl.com'; }
+      catch { return 'http://neverssl.com'; }
+    }
+
+    const form = document.getElementById("loginForm");
+    const errorDiv = document.getElementById("error");
+
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      errorDiv.textContent = "";
+
+      const email = document.getElementById("email").value.trim();
+
+      const payload = {
+        email,
+        clientMac: qs.get("clientMac") || "",
+        apMac: qs.get("apMac") || "",
+        ssidName: qs.get("ssidName") || "",
+        radioId: qs.get("radioId") || "",
+        site: qs.get("site") || "",
+        redirectUrl: safeRedirect()
+      };
+
+      try {
+        const res = await fetch("/api/authorize", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+
+        const text = await res.text();
+        if (!res.ok) {
+          try {
+            const data = JSON.parse(text);
+            errorDiv.textContent = data.error || "Authorize failed. Try again.";
+          } catch {
+            errorDiv.textContent = "Authorize failed. Try again.";
+          }
+          return;
+        }
+
+        try {
+          const data = JSON.parse(text);
+          if (data.redirectUrl) location.href = data.redirectUrl;
+          else location.href = payload.redirectUrl;
+        } catch {
+          location.href = payload.redirectUrl;
+        }
+      } catch (err) {
+        console.error("[SPLASH] submit error", err);
+        errorDiv.textContent = "Network error. Try again.";
+      }
+    });
+  </script>
+</body>
+</html>
