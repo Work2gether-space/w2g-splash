@@ -1,7 +1,7 @@
 // api/authorize.js  Vercel Node runtime, ESM style
-// Build: 2025-08-15d+redis-ping
+// Build: 2025-08-15e redis-verified
 
-console.log("DEBUG: authorize.js build version 2025-08-15d+redis-ping");
+console.log("DEBUG: authorize.js build version 2025-08-15e");
 
 export default async function handler(req, res) {
   const rid = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
@@ -16,29 +16,20 @@ export default async function handler(req, res) {
   const axios = (await import('axios')).default;
   const https = await import('https');
 
-  // --- NEW: dynamic import of Redis util (works with CJS or ESM)
-  let getRedis = null;
-  try {
-    const mod = await import('../lib/redis.js');
-    getRedis = mod.getRedis || (mod.default && mod.default.getRedis) || null;
-  } catch (e) {
-    // If lib/redis.js doesn't exist in a preview, we just skip the ping
-    console.warn('[authorize] Redis module not loaded:', e?.message || e);
-  }
-
+  // read env
   const {
     // Omada
-    OMADA_BASE,              // eg https://98.114.198.237:9443
-    OMADA_CONTROLLER_ID,     // eg fc2b25d44a950a6357313da0afb4c14a
-    OMADA_OPERATOR_USER,     // operator username
-    OMADA_OPERATOR_PASS,     // operator password
+    OMADA_BASE,
+    OMADA_CONTROLLER_ID,
+    OMADA_OPERATOR_USER,
+    OMADA_OPERATOR_PASS,
 
     // Nexudus
-    NEXUDUS_BASE,            // eg https://w2gdtown.spaces.nexudus.com
-    NEXUDUS_USER,            // API user
-    NEXUDUS_PASS,            // API pass
+    NEXUDUS_BASE,
+    NEXUDUS_USER,
+    NEXUDUS_PASS,
 
-    // App timezone for Basic window
+    // App timezone
     APP_TZ = 'America/New_York'
   } = process.env;
 
@@ -65,26 +56,7 @@ export default async function handler(req, res) {
   const site        = body.site || '';
   const redirectUrl = body.redirectUrl || 'http://neverssl.com';
   const email       = body.email || '';
-  const extend      = !!body.extend; // buy extra hour to 5:15
-
-  // --- NEW: lightweight Redis connectivity ping (no behavior change)
-  if (getRedis) {
-    try {
-      const redis = getRedis();
-      await redis.set(
-        `w2g:auth-ping:${Date.now()}`,
-        JSON.stringify({
-          when: new Date().toISOString(),
-          mac: clientMac || '(none)',
-          site: site || '(none)'
-        }),
-        'EX',
-        300 // 5 minutes
-      );
-    } catch (e) {
-      console.warn('[authorize] Redis ping failed:', e?.message || e);
-    }
-  }
+  const extend      = !!body.extend;
 
   log('REQUEST BODY (redacted):', {
     clientMac: clientMac ? '(present)' : '',
@@ -97,6 +69,18 @@ export default async function handler(req, res) {
     redirectUrl
   });
 
+  // Redis ping first thing so we can see it in logs for any path
+  try {
+    const { getRedis } = await import('../lib/redis.js');
+    log('Redis ping start');
+    const redis = await getRedis();
+    const key = `w2g:auth-ping:${clientMac || 'unknown'}`;
+    await redis.set(key, JSON.stringify({ when: new Date().toISOString(), site: site || '(none)' }), { EX: 300 });
+    log(`Redis key set ${key}`);
+  } catch (e) {
+    console.error(`[authorize][${rid}] Redis ping error`, e?.message || e);
+  }
+
   if (!clientMac || !site) {
     err('Missing required fields: clientMac or site.');
     return res.status(400).json({ ok: false, error: 'Missing clientMac or site from splash redirect.' });
@@ -107,13 +91,13 @@ export default async function handler(req, res) {
     return res.status(400).json({ ok: false, error: 'Email is required on the splash form.' });
   }
 
-  // axios client that accepts self signed cert for Omada
+  // axios that accepts self signed cert for Omada
   const http = axios.create({
     timeout: 15000,
     httpsAgent: new (https.Agent)({ rejectUnauthorized: false })
   });
 
-  // plain axios for Nexudus (valid certs)
+  // plain axios for Nexudus
   const nx = axios.create({
     baseURL: NEXUDUS_BASE.replace(/\/+$/, ''),
     timeout: 15000,
@@ -137,7 +121,6 @@ export default async function handler(req, res) {
   }
 
   async function nxGetMoneyBalance(coworkerId) {
-    // Sum of Money Transactions for coworker
     const url = `/api/billing/moneytransactions?moneytransaction_coworker=${encodeURIComponent(coworkerId)}&_take=500`;
     const r = await nx.get(url, { validateStatus: () => true });
     if (r.status !== 200) throw new Error(`Nexudus moneytransactions HTTP ${r.status}`);
@@ -146,7 +129,6 @@ export default async function handler(req, res) {
   }
 
   async function nxCreateMoneyHold(coworkerId, amount, note) {
-    // Negative amount reserves credit (Nexudus debits immediately)
     const payload = {
       MoneyTransaction_Coworker: coworkerId,
       MoneyTransaction_Amount: -Math.abs(Number(amount)),
@@ -155,11 +137,10 @@ export default async function handler(req, res) {
     };
     const r = await nx.post(`/api/billing/moneytransactions`, payload, { validateStatus: () => true });
     if (r.status !== 200) throw new Error(`Hold create failed HTTP ${r.status}`);
-    return r.data; // expect an Id field
+    return r.data;
   }
 
   async function nxRefundMoneyHold(hold) {
-    // Refund equals positive mirror of the hold
     const coworkerId = hold.MoneyTransaction_Coworker || hold.Coworker_Id;
     const amt = Math.abs(Number(hold.MoneyTransaction_Amount ?? hold.Amount ?? 0));
     if (!coworkerId || !amt) throw new Error('Refund missing coworker or amount');
@@ -180,13 +161,12 @@ export default async function handler(req, res) {
       console.warn(`[authorize][${rid}] APP_TZ is not set. Defaulting to America/New_York.`);
     }
     const now = new Date(nowUtc);
-
-    const dow = now.getDay(); // 0 Sun..6 Sat
+    const dow = now.getDay();
     if (dow === 0 || dow === 6) return { allowed: false, reason: 'Not available on weekends' };
 
-    const open = setLocalTime(new Date(now), 8, 50, 0);    // 8:50
-    const endStd = setLocalTime(new Date(now), 16, 10, 0); // 4:10
-    const endHard = setLocalTime(new Date(now), 17, 15, 0); // 5:15
+    const open = setLocalTime(new Date(now), 8, 50, 0);
+    const endStd = setLocalTime(new Date(now), 16, 10, 0);
+    const endHard = setLocalTime(new Date(now), 17, 15, 0);
 
     if (now < open) return { allowed: false, reason: 'Access starts at 8:50' };
     if (now >= endHard) return { allowed: false, reason: 'Closed for the day' };
@@ -220,7 +200,7 @@ export default async function handler(req, res) {
 
   /* ---------- Flow ---------- */
 
-  // 0) Nexudus precheck: must exist and have active Basic contract
+  // 0) Nexudus precheck
   let coworker, holds = [];
   try {
     coworker = await nxGetCoworkerByEmail(email);
@@ -247,19 +227,12 @@ export default async function handler(req, res) {
   if (!policy.allowed) return res.status(403).json({ ok: false, error: policy.reason });
 
   // 2) Determine holds
-  // Base session uses 5. Late window requires extra hour => 5.
-  // If user selects extend during standard window, add another 5.
   let requiredHold = 5;
   let useExtend = extend;
-
-  if (policy.phase === 'standard' && extend) {
-    requiredHold = 10; // base 5 + extra hour 5
-  }
+  if (policy.phase === 'standard' && extend) requiredHold = 10;
   if (policy.phase === 'late') {
-    if (!extend) {
-      return res.status(402).json({ ok: false, error: 'Extra hour required. Select Extend to continue.' });
-    }
-    requiredHold = 5; // only the extra hour in late window
+    if (!extend) return res.status(402).json({ ok: false, error: 'Extra hour required. Select Extend to continue.' });
+    requiredHold = 5;
     useExtend = true;
   }
 
@@ -270,7 +243,6 @@ export default async function handler(req, res) {
     if (balance < requiredHold) {
       return res.status(402).json({ ok: false, error: 'Not enough credits for WiFi session' });
     }
-    // Split into clear ledger entries
     const baseHold = await nxCreateMoneyHold(coworker.Id, 5, 'WiFi session hold');
     holds.push(baseHold);
     if (useExtend) {
@@ -313,7 +285,7 @@ export default async function handler(req, res) {
     ssidName,
     radioId: radioIdRaw ? Number(radioIdRaw) : 1,
     site,
-    time: String(Math.max(60000, policy.msRemaining)), // ms
+    time: String(Math.max(60000, policy.msRemaining)),
     authType: 4
   };
 
@@ -340,4 +312,3 @@ async function refundAll(holds, refundFn, logErr) {
     try { await refundFn(h); } catch (e) { logErr('Refund error', e?.message || e); }
   }
 }
-
