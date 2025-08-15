@@ -1,7 +1,7 @@
 // api/authorize.js  Vercel Node runtime, ESM style
-// Build: 2025-08-15d
+// Build: 2025-08-15d+redis-ping
 
-console.log("DEBUG: authorize.js build version 2025-08-15d");
+console.log("DEBUG: authorize.js build version 2025-08-15d+redis-ping");
 
 export default async function handler(req, res) {
   const rid = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
@@ -15,6 +15,16 @@ export default async function handler(req, res) {
   // dynamic imports to stay ESM friendly on Vercel
   const axios = (await import('axios')).default;
   const https = await import('https');
+
+  // --- NEW: dynamic import of Redis util (works with CJS or ESM)
+  let getRedis = null;
+  try {
+    const mod = await import('../lib/redis.js');
+    getRedis = mod.getRedis || (mod.default && mod.default.getRedis) || null;
+  } catch (e) {
+    // If lib/redis.js doesn't exist in a preview, we just skip the ping
+    console.warn('[authorize] Redis module not loaded:', e?.message || e);
+  }
 
   const {
     // Omada
@@ -56,6 +66,25 @@ export default async function handler(req, res) {
   const redirectUrl = body.redirectUrl || 'http://neverssl.com';
   const email       = body.email || '';
   const extend      = !!body.extend; // buy extra hour to 5:15
+
+  // --- NEW: lightweight Redis connectivity ping (no behavior change)
+  if (getRedis) {
+    try {
+      const redis = getRedis();
+      await redis.set(
+        `w2g:auth-ping:${Date.now()}`,
+        JSON.stringify({
+          when: new Date().toISOString(),
+          mac: clientMac || '(none)',
+          site: site || '(none)'
+        }),
+        'EX',
+        300 // 5 minutes
+      );
+    } catch (e) {
+      console.warn('[authorize] Redis ping failed:', e?.message || e);
+    }
+  }
 
   log('REQUEST BODY (redacted):', {
     clientMac: clientMac ? '(present)' : '',
@@ -117,7 +146,7 @@ export default async function handler(req, res) {
   }
 
   async function nxCreateMoneyHold(coworkerId, amount, note) {
-    // Negative amount reserves credit
+    // Negative amount reserves credit (Nexudus debits immediately)
     const payload = {
       MoneyTransaction_Coworker: coworkerId,
       MoneyTransaction_Amount: -Math.abs(Number(amount)),
@@ -147,11 +176,9 @@ export default async function handler(req, res) {
 
   /* ---------- Time policy for Basic ---------- */
   function computeBasicPolicy(nowUtc) {
-    // We rely on Vercel to provide local time based on our own env setting
     if (!process.env.APP_TZ) {
       console.warn(`[authorize][${rid}] APP_TZ is not set. Defaulting to America/New_York.`);
     }
-    // Node will still use system time. We set hours directly on a Date
     const now = new Date(nowUtc);
 
     const dow = now.getDay(); // 0 Sun..6 Sat
