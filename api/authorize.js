@@ -1,7 +1,7 @@
 // api/authorize.js  Vercel Node runtime, ESM style
-// Build: 2025-08-15c
+// Build: 2025-08-15d
 
-console.log("DEBUG: authorize.js build version 2025-08-15c");
+console.log("DEBUG: authorize.js build version 2025-08-15d");
 
 export default async function handler(req, res) {
   const rid = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
@@ -28,8 +28,8 @@ export default async function handler(req, res) {
     NEXUDUS_USER,            // API user
     NEXUDUS_PASS,            // API pass
 
-    // Time zone for Basic window
-    TZ = 'America/New_York'
+    // App timezone for Basic window
+    APP_TZ = 'America/New_York'
   } = process.env;
 
   if (!OMADA_BASE || !OMADA_CONTROLLER_ID || !OMADA_OPERATOR_USER || !OMADA_OPERATOR_PASS) {
@@ -122,7 +122,7 @@ export default async function handler(req, res) {
       MoneyTransaction_Coworker: coworkerId,
       MoneyTransaction_Amount: -Math.abs(Number(amount)),
       MoneyTransaction_Notes: note || 'WiFi session hold',
-      MoneyTransaction_Source: 1 // manual
+      MoneyTransaction_Source: 1
     };
     const r = await nx.post(`/api/billing/moneytransactions`, payload, { validateStatus: () => true });
     if (r.status !== 200) throw new Error(`Hold create failed HTTP ${r.status}`);
@@ -147,17 +147,17 @@ export default async function handler(req, res) {
 
   /* ---------- Time policy for Basic ---------- */
   function computeBasicPolicy(nowUtc) {
-    // Require server TZ = America/New_York for correct local hours
-    if (process.env.TZ !== TZ) {
-      // not fatal, but log for visibility
-      console.warn(`[authorize][${rid}] TZ env is "${process.env.TZ || ''}", expected "${TZ}"`);
+    // We rely on Vercel to provide local time based on our own env setting
+    if (!process.env.APP_TZ) {
+      console.warn(`[authorize][${rid}] APP_TZ is not set. Defaulting to America/New_York.`);
     }
-    const now = new Date(nowUtc); // assume TZ is set to Eastern
+    // Node will still use system time. We set hours directly on a Date
+    const now = new Date(nowUtc);
 
     const dow = now.getDay(); // 0 Sun..6 Sat
     if (dow === 0 || dow === 6) return { allowed: false, reason: 'Not available on weekends' };
 
-    const open = setLocalTime(new Date(now), 8, 50, 0);   // 8:50
+    const open = setLocalTime(new Date(now), 8, 50, 0);    // 8:50
     const endStd = setLocalTime(new Date(now), 16, 10, 0); // 4:10
     const endHard = setLocalTime(new Date(now), 17, 15, 0); // 5:15
 
@@ -220,8 +220,8 @@ export default async function handler(req, res) {
   if (!policy.allowed) return res.status(403).json({ ok: false, error: policy.reason });
 
   // 2) Determine holds
-  // Base session uses $5. Late window requires extra hour => $5.
-  // If user proactively selects extend during standard window, add another $5.
+  // Base session uses 5. Late window requires extra hour => 5.
+  // If user selects extend during standard window, add another 5.
   let requiredHold = 5;
   let useExtend = extend;
 
@@ -243,7 +243,7 @@ export default async function handler(req, res) {
     if (balance < requiredHold) {
       return res.status(402).json({ ok: false, error: 'Not enough credits for WiFi session' });
     }
-    // Split into clear ledger entries: one or two $5 holds
+    // Split into clear ledger entries
     const baseHold = await nxCreateMoneyHold(coworker.Id, 5, 'WiFi session hold');
     holds.push(baseHold);
     if (useExtend) {
@@ -264,7 +264,6 @@ export default async function handler(req, res) {
 
   if (loginStatus !== 200 || loginData?.errorCode !== 0) {
     err('LOGIN failed', loginStatus, 'detail:', JSON.stringify(loginData || {}));
-    // refund holds before exit
     await refundAll(holds, nxRefundMoneyHold, err);
     return res.status(502).json({ ok: false, error: 'Hotspot login failed', detail: loginData });
   }
@@ -314,3 +313,4 @@ async function refundAll(holds, refundFn, logErr) {
     try { await refundFn(h); } catch (e) { logErr('Refund error', e?.message || e); }
   }
 }
+
