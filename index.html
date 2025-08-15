@@ -6,6 +6,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400&display=swap" rel="stylesheet">
   <style>
+    /* Make width calculations include padding and border so 100% fits cleanly */
+    *, *::before, *::after { box-sizing: border-box; }
+
     html, body {
       height: 100%;
       margin: 0;
@@ -21,7 +24,7 @@
     }
     .card {
       border: 1px solid #ccc;
-      padding: 2rem;                /* equal padding all sides */
+      padding: 2rem;
       border-radius: 10px;
       box-shadow: 0 0 15px rgba(0,0,0,0.1);
       text-align: center;
@@ -35,36 +38,40 @@
       color: #b03b1c;
       margin-bottom: 1rem;
       font-size: 1.5rem;
-      font-weight: 400;             /* normal weight */
+      font-weight: 400;
     }
     .card p {
       margin-bottom: 1rem;
-      font-weight: 400;             /* normal weight */
+      font-weight: 400;
     }
+    form { margin: 0; }
+
     .card input {
+      display: block;
       width: 100%;
-      padding: 0.75rem;             /* equal left and right padding */
+      padding: 0.75rem;
       margin-bottom: 1rem;
       border: 1px solid #aaa;
       border-radius: 5px;
       font-size: 1rem;
-      font-weight: 400;             /* normal weight */
+      font-weight: 400;
     }
     .card button {
+      display: block;
       width: 100%;
-      padding: 0.75rem;             /* equal left and right padding */
-      background: #000;             /* black default */
+      padding: 0.75rem;
+      background: #000;
       color: #fff;
       font-size: 1rem;
-      font-weight: 400;             /* Montserrat normal */
+      font-weight: 400;
       cursor: pointer;
-      border: 1px solid #000;       /* thin black outline */
-      border-radius: 0;             /* square corners */
+      border: 1px solid #000;
+      border-radius: 0;
       transition: background 0.2s, color 0.2s;
     }
     .card button:hover {
-      background: transparent;      /* transparent on hover */
-      color: #000;                  /* text switches to black */
+      background: transparent;
+      color: #000;
     }
     .card .info {
       margin-top: 1rem;
@@ -78,6 +85,7 @@
       margin-top: 0.75rem;
       font-size: 0.9rem;
       font-weight: 400;
+      min-height: 1.2em; /* keeps layout steady when errors appear */
     }
     @media (max-height: 500px) {
       body { align-items: flex-start; padding-top: 2rem; }
@@ -88,15 +96,17 @@
   <div class="card">
     <h1>Welcome to Work2gether</h1>
     <p>Please log in to start your session</p>
-    <form id="loginForm">
-      <input type="email" id="email" placeholder="you@example.com" required />
+
+    <form id="loginForm" novalidate>
+      <input type="email" id="email" placeholder="you@example.com" autocomplete="email" required />
       <button type="submit">Start Session</button>
     </form>
+
     <div class="info">
       Your time of access will determine how credits are used.<br>
       Make sure to log out if you're done.
     </div>
-    <div class="error" id="error"></div>
+    <div class="error" id="error" role="alert" aria-live="polite"></div>
   </div>
 
   <script>
@@ -104,7 +114,8 @@
 
     function safeRedirect() {
       const r = qs.get('redirectUrl');
-      try { return r ? decodeURIComponent(r) : 'http://neverssl.com'; } catch { return 'http://neverssl.com'; }
+      try { return r ? decodeURIComponent(r) : 'http://neverssl.com'; }
+      catch { return 'http://neverssl.com'; }
     }
 
     const form = document.getElementById("loginForm");
@@ -112,6 +123,7 @@
 
     form.addEventListener("submit", async (e) => {
       e.preventDefault();
+      errorDiv.textContent = "";
 
       const email = document.getElementById("email").value.trim();
 
