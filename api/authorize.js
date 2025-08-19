@@ -1,7 +1,7 @@
 // api/authorize.js  Vercel Node runtime, ESM style
-// Build: 2025-08-19i site-name+mac-colons+time-us + redis-ledger + monthly-7500
+// Build: 2025-08-19j site-name + MAC-hyphens + time-unit-fallback + redis-ledger + monthly-7500
 
-console.log("DEBUG: authorize.js build version 2025-08-19i");
+console.log("DEBUG: authorize.js build version 2025-08-19j");
 
 export default async function handler(req, res) {
   const rid = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
@@ -23,7 +23,7 @@ export default async function handler(req, res) {
     OMADA_CONTROLLER_ID,
     OMADA_OPERATOR_USER,
     OMADA_OPERATOR_PASS,
-    OMADA_SITE_NAME, // <= set this to "W2G Dtown" in Vercel env
+    OMADA_SITE_NAME, // set to "W2G Dtown" in Vercel
 
     // Nexudus
     NEXUDUS_BASE,
@@ -67,9 +67,9 @@ export default async function handler(req, res) {
   // Force Omada site to env name if provided
   const omadaSite = (OMADA_SITE_NAME && OMADA_SITE_NAME.trim()) || siteFromBody || 'Default';
 
-  // MACs in colon format for Omada
-  const clientMac = macToColons(clientMacRaw);
-  const apMac     = macToColons(apMacRaw);
+  // MACs in HYPHEN format for Omada (e.g., AA-BB-CC-DD-EE-FF)
+  const clientMac = macToHyphens(clientMacRaw);
+  const apMac     = macToHyphens(apMacRaw);
 
   log('REQUEST BODY (redacted):', {
     clientMac: clientMac ? '(present)' : '',
@@ -221,10 +221,10 @@ export default async function handler(req, res) {
     return Number.isFinite(n) ? Math.round(n) : d;
   }
 
-  function macToColons(mac) {
+  function macToHyphens(mac) {
     const hex = String(mac || '').toUpperCase().replace(/[^0-9A-F]/g, '');
-    if (hex.length !== 12) return String(mac || '').toUpperCase().replace(/[^0-9A-F]/g, ':');
-    return hex.match(/.{1,2}/g).join(':');
+    if (hex.length !== 12) return String(mac || '').toUpperCase().replace(/[^0-9A-F]/g, '-');
+    return hex.match(/.{1,2}/g).join('-');
   }
 
   /* Flow */
@@ -294,7 +294,7 @@ export default async function handler(req, res) {
       email,
       plan: isBasic ? 'basic' : (hasClassic ? 'classic' : (has247 ? '247' : 'other')),
       cycle: cycleKey,
-      remainingCents: MONTHLY_CENTS,
+      remainingCents: toInt(BASIC_MONTHLY_CENTS, 7500),
       spentCents: 0,
       checkins: 0,
       lastUpdated: new Date().toISOString()
@@ -334,7 +334,7 @@ export default async function handler(req, res) {
     return res.status(502).json({ ok: false, error: 'Login returned no CSRF token' });
   }
 
-  // Build Cookie header from pairs only, and also add a csrf cookie for safety
+  // Build Cookie header from pairs only, also add a csrf cookie (harmless if ignored)
   const cookiePairs = Array.isArray(loginCookies)
     ? loginCookies.map(c => String(c).split(';')[0]).filter(Boolean)
     : [];
@@ -342,19 +342,13 @@ export default async function handler(req, res) {
   const cookieHeader = cookiePairs.length ? { Cookie: cookiePairs.join('; ') } : {};
   log('Login cookies parsed count=', cookiePairs.length, 'csrf(len)=', String(csrf || '').length);
 
-  // 4 Omada authorize (site name, mac colons, time in microseconds)
-  const timeMs = Math.max(60000, Number(policyNow.msRemaining) || 60000);
-  const timeUs = timeMs * 1000;
-
-  const payload = {
-    clientMac,
-    apMac,
-    ssidName,
-    radioId: Number(radioIdRaw) || 1,
-    site: omadaSite,        // <-- Site NAME, not GUID
-    time: timeUs,           // <-- microseconds per Omada spec
-    authType: 4
-  };
+  // 4 Omada authorize with time unit fallback (ms -> us -> s)
+  const timeMsBase = Math.max(60000, Number(policyNow.msRemaining) || 60000);
+  const attempts = [
+    { unit: 'ms', value: timeMsBase },
+    { unit: 'us', value: timeMsBase * 1000 },
+    { unit: 's',  value: Math.floor(timeMsBase / 1000) }
+  ];
 
   const strictHeaders = {
     ...cookieHeader,
@@ -365,14 +359,41 @@ export default async function handler(req, res) {
     'Referer': `${base}/${OMADA_CONTROLLER_ID}/portal`
   };
 
-  log('AUTHORIZE POST ->', AUTH_URL, 'payload:', { ...payload, clientMac: '(present)', apMac: '(present)' });
+  let authOk = false, lastAuth = { status: 0, data: null }, usedUnit = 'ms';
+  for (let i = 0; i < attempts.length; i++) {
+    const attempt = attempts[i];
+    const payload = {
+      clientMac,
+      apMac,
+      ssidName,
+      radioId: Number(radioIdRaw) || 1,
+      site: omadaSite,
+      time: attempt.value,
+      authType: 4
+    };
 
-  const { data: authData, status: authStatus } =
-    await postJson(AUTH_URL, payload, strictHeaders);
+    log(`AUTHORIZE ATTEMPT ${i + 1}/${attempts.length} unit=${attempt.unit} ->`, AUTH_URL, 'payload:', { ...payload, clientMac: '(present)', apMac: '(present)' });
 
-  if (!(authStatus === 200 && authData?.errorCode === 0)) {
-    err('AUTH failed status', authStatus, 'detail:', JSON.stringify(authData || {}));
-    return res.status(502).json({ ok: false, error: 'Authorization failed', detail: authData });
+    const { data: authData, status: authStatus } =
+      await postJson(AUTH_URL, payload, strictHeaders);
+
+    lastAuth = { status: authStatus, data: authData };
+    usedUnit = attempt.unit;
+    if (authStatus === 200 && authData?.errorCode === 0) {
+      authOk = true;
+      break;
+    }
+
+    // If the controller complains about auth, try next unit
+    if (!(authStatus === 200 && authData?.errorCode === -41501)) {
+      // For other errors, don't keep hammering
+      break;
+    }
+  }
+
+  if (!authOk) {
+    err(`AUTH failed after time-unit fallback (last unit=${usedUnit}) status`, lastAuth.status, 'detail:', JSON.stringify(lastAuth.data || {}));
+    return res.status(502).json({ ok: false, error: 'Authorization failed', detail: lastAuth.data });
   }
 
   // 5 Record debit after Omada success
@@ -383,7 +404,7 @@ export default async function handler(req, res) {
       apMac,
       ssidName,
       site: omadaSite,
-      durationMs: timeMs,
+      durationMs: timeMsBase,
       phase: policyNow.phase,
       extend: !!extend,
       debitCents: isBasic ? requiredCents : 0,
@@ -421,8 +442,8 @@ function toInt(v, d) {
   return Number.isFinite(n) ? Math.round(n) : d;
 }
 
-function macToColons(mac) {
+function macToHyphens(mac) {
   const hex = String(mac || '').toUpperCase().replace(/[^0-9A-F]/g, '');
-  if (hex.length !== 12) return String(mac || '').toUpperCase().replace(/[^0-9A-F]/g, ':');
-  return hex.match(/.{1,2}/g).join(':');
+  if (hex.length !== 12) return String(mac || '').toUpperCase().replace(/[^0-9A-F]/g, '-');
+  return hex.match(/.{1,2}/g).join('-');
 }
