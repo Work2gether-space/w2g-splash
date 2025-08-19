@@ -1,7 +1,7 @@
 // api/authorize.js  Vercel Node runtime, ESM style
-// Build: 2025-08-19f cookie-fix + tz-accurate-basic-policy + redis-ledger + monthly-7500
+// Build: 2025-08-19h auth-headers+csrf-cookie + cookie-fix + tz-accurate-basic-policy + redis-ledger + monthly-7500
 
-console.log("DEBUG: authorize.js build version 2025-08-19f");
+console.log("DEBUG: authorize.js build version 2025-08-19h");
 
 export default async function handler(req, res) {
   const rid = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
@@ -33,7 +33,7 @@ export default async function handler(req, res) {
     APP_TZ = 'America/New_York',
 
     // Credit config in cents
-    BASIC_MONTHLY_CENTS = '7500',  // default is $75
+    BASIC_MONTHLY_CENTS = '7500',  // $75 default
     BASIC_SESSION_CENTS = '500',
     BASIC_EXTEND_CENTS  = '500'
   } = process.env;
@@ -54,8 +54,8 @@ export default async function handler(req, res) {
 
   // body
   const body = (req.body && typeof req.body === 'object') ? req.body : {};
-  const clientMac   = body.clientMac || body.client_id || '';
-  const apMac       = body.apMac || '';
+  const clientMac   = normalizeMac(body.clientMac || body.client_id || '');
+  const apMac       = normalizeMac(body.apMac || '');
   const ssidName    = body.ssidName || body.ssid || '';
   const radioIdRaw  = body.radioId || body.radio || '';
   const site        = body.site || '';
@@ -124,12 +124,7 @@ export default async function handler(req, res) {
     return Array.isArray(r.data?.Records) ? r.data.Records : [];
   }
 
-  /* Time policy for Basic
-     New York time
-     Standard 09:00 to 16:00
-     Late 16:00 to 16:15 requires extend=true
-     Hard cutoff 16:15
-  */
+  /* Time policy for Basic (New York) */
 
   function computeBasicPolicyTZ(nowUtc, tz) {
     const t = new Date(nowUtc);
@@ -153,19 +148,12 @@ export default async function handler(req, res) {
     const lateStart = 16 * 60;
     const hardCut = 16 * 60 + 15;
 
-    if (mins < start) {
-      const msRemaining = (start - mins) * 60 * 1000;
-      return { allowed: false, reason: 'Access starts at 09:00', msRemaining };
-    }
-    if (mins >= hardCut) {
-      return { allowed: false, reason: 'Closed for the day' };
-    }
+    if (mins < start) return { allowed: false, reason: 'Access starts at 09:00', msRemaining: (start - mins) * 60 * 1000 };
+    if (mins >= hardCut) return { allowed: false, reason: 'Closed for the day' };
     if (mins >= lateStart && mins < hardCut) {
-      const msRemaining = Math.max(60000, (hardCut - mins) * 60 * 1000);
-      return { allowed: true, phase: 'late', msRemaining, cutoffISO: toCutoffISO(t, tz, hardCut) };
+      return { allowed: true, phase: 'late', msRemaining: Math.max(60000, (hardCut - mins) * 60 * 1000), cutoffISO: toCutoffISO(t, tz, hardCut) };
     }
-    const msRemaining = Math.max(60000, (lateStart - mins) * 60 * 1000);
-    return { allowed: true, phase: 'standard', msRemaining, cutoffISO: toCutoffISO(t, tz, lateStart) };
+    return { allowed: true, phase: 'standard', msRemaining: Math.max(60000, (lateStart - mins) * 60 * 1000), cutoffISO: toCutoffISO(t, tz, lateStart) };
   }
 
   function toCutoffISO(nowUtcDate, tz, cutoffMins) {
@@ -223,6 +211,10 @@ export default async function handler(req, res) {
   function toInt(v, d) {
     const n = Number(v);
     return Number.isFinite(n) ? Math.round(n) : d;
+  }
+
+  function normalizeMac(mac) {
+    return String(mac || '').trim().toUpperCase().replace(/[^0-9A-F]/g, '-');
   }
 
   /* Flow */
@@ -332,28 +324,38 @@ export default async function handler(req, res) {
     return res.status(502).json({ ok: false, error: 'Login returned no CSRF token' });
   }
 
-  // Build Cookie header from pairs only
+  // Build Cookie header from pairs only, and also add a csrf cookie for safety
   const cookiePairs = Array.isArray(loginCookies)
     ? loginCookies.map(c => String(c).split(';')[0]).filter(Boolean)
     : [];
+  if (csrf) cookiePairs.push(`csrfToken=${csrf}`);
   const cookieHeader = cookiePairs.length ? { Cookie: cookiePairs.join('; ') } : {};
-  log('Login cookies parsed count=', cookiePairs.length);
+  log('Login cookies parsed count=', cookiePairs.length, 'csrf(len)=', String(csrf || '').length);
 
-  // 4 Omada authorize
+  // 4 Omada authorize (strict headers)
   const payload = {
     clientMac,
     apMac,
     ssidName,
     radioId: radioIdRaw ? Number(radioIdRaw) : 1,
     site,
-    time: String(Math.max(60000, policyNow.msRemaining)),
+    time: Math.max(60000, Number(policyNow.msRemaining) || 60000), // integer milliseconds
     authType: 4
+  };
+
+  const strictHeaders = {
+    ...cookieHeader,
+    'Csrf-Token': csrf,
+    'X-Csrf-Token': csrf,
+    'X-Requested-With': 'XMLHttpRequest',
+    'Origin': base,
+    'Referer': `${base}/${OMADA_CONTROLLER_ID}/portal`
   };
 
   log('AUTHORIZE POST ->', AUTH_URL, 'payload:', { ...payload, clientMac: '(present)', apMac: '(present)' });
 
   const { data: authData, status: authStatus } =
-    await postJson(AUTH_URL, payload, { 'Csrf-Token': csrf, ...cookieHeader });
+    await postJson(AUTH_URL, payload, strictHeaders);
 
   if (!(authStatus === 200 && authData?.errorCode === 0)) {
     err('AUTH failed status', authStatus, 'detail:', JSON.stringify(authData || {}));
@@ -368,7 +370,7 @@ export default async function handler(req, res) {
       apMac,
       ssidName,
       site,
-      durationMs: Math.max(60000, policyNow.msRemaining),
+      durationMs: payload.time,
       phase: policyNow.phase,
       extend: !!extend,
       debitCents: isBasic ? requiredCents : 0,
@@ -404,4 +406,8 @@ export default async function handler(req, res) {
 function toInt(v, d) {
   const n = Number(v);
   return Number.isFinite(n) ? Math.round(n) : d;
+}
+
+function normalizeMac(mac) {
+  return String(mac || '').trim().toUpperCase().replace(/[^0-9A-F]/g, '-');
 }
