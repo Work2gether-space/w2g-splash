@@ -1,7 +1,7 @@
 // api/authorize.js  Vercel Node runtime, ESM style
-// Build: 2025-08-19k omada-compat-matrix + redis-ledger + monthly-7500
+// Build: 2025-08-19k.1 omada-compat-matrix + redis-ledger (lPush fix) + monthly-7500
 
-console.log("DEBUG: authorize.js build version 2025-08-19k");
+console.log("DEBUG: authorize.js build version 2025-08-19k.1");
 
 export default async function handler(req, res) {
   const rid = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
@@ -292,7 +292,6 @@ export default async function handler(req, res) {
         const { data: authData, status: authStatus } = await postJson(AUTH_URL, payload, strictHeaders);
         last = { status: authStatus, data: authData, note: `mac=${mf.label} time=${tu.label} authType=${at}` };
         if (authStatus === 200 && authData?.errorCode === 0) { authOk = true; break outer; }
-        // -41501 => keep iterating; other error => bail early
         if (!(authStatus === 200 && authData?.errorCode === -41501)) break;
       }
     }
@@ -324,7 +323,8 @@ export default async function handler(req, res) {
     ledger.checkins = Number(ledger.checkins) + 1;
     ledger.lastUpdated = new Date().toISOString();
     await redis.set(ledgerKey, JSON.stringify(ledger));
-    await redis.lpush(eventsKey, JSON.stringify(event));
+    // FIX: node-redis v4 uses camelCase lPush
+    await redis.lPush(eventsKey, JSON.stringify(event));
     log(`Ledger updated ${ledgerKey} remaining=${ledger.remainingCents} spent=${ledger.spentCents}`);
   } catch (e) {
     err('Ledger write error:', e?.message || e);
@@ -337,3 +337,13 @@ export default async function handler(req, res) {
 
 /* utils */
 function toInt(v, d) { const n = Number(v); return Number.isFinite(n) ? Math.round(n) : d; }
+function macToColons(mac) {
+  const hex = String(mac || '').toUpperCase().replace(/[^0-9A-F]/g, '');
+  if (hex.length !== 12) return String(mac || '').toUpperCase().replace(/[^0-9A-F]/g, ':');
+  return hex.match(/.{1,2}/g).join(':');
+}
+function macToHyphens(mac) {
+  const hex = String(mac || '').toUpperCase().replace(/[^0-9A-F]/g, '');
+  if (hex.length !== 12) return String(mac || '').toUpperCase().replace(/[^0-9A-F]/g, '-');
+  return hex.match(/.{1,2}/g).join('-');
+}
