@@ -1,7 +1,7 @@
 // api/authorize.js  Vercel Node runtime, ESM style
-// Build: 2025-08-19k.2 omada-compat-matrix + redis-ledger (lPush fix) + monthly reconciliation to env cap
+// Build: 2025-08-19k.3  (adds robust Omada login retry for transient 5xx/HTML responses)
 
-console.log("DEBUG: authorize.js build version 2025-08-19k.2");
+console.log("DEBUG: authorize.js build version 2025-08-19k.3");
 
 export default async function handler(req, res) {
   const rid = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
@@ -227,7 +227,6 @@ export default async function handler(req, res) {
     const seed = { coworkerId: coworker.Id, email, plan: isBasic ? 'basic' : (hasClassic ? 'classic' : (has247 ? '247' : 'other')), cycle: cycleKey, remainingCents: MONTHLY_CENTS, spentCents: 0, checkins: 0, lastUpdated: new Date().toISOString() };
     ledger = await getOrInitLedger(redis, ledgerKey, seed);
 
-    // NEW: reconcile if current cap (remaining+spent) is below env BASIC_MONTHLY_CENTS
     const currentCap = Number(ledger.remainingCents || 0) + Number(ledger.spentCents || 0);
     if (currentCap < MONTHLY_CENTS) {
       const bump = MONTHLY_CENTS - currentCap;
@@ -246,14 +245,30 @@ export default async function handler(req, res) {
     return res.status(502).json({ ok: false, error: 'Credit ledger unavailable' });
   }
 
-  // 3) Omada login
-  log('LOGIN try:', LOGIN_URL);
-  const { data: loginData, status: loginStatus, cookies: loginCookies, headers: loginHeaders } =
-    await postJson(LOGIN_URL, { name: OMADA_OPERATOR_USER, password: OMADA_OPERATOR_PASS });
-  if (loginStatus !== 200 || loginData?.errorCode !== 0) {
-    err('LOGIN failed', loginStatus, 'detail:', JSON.stringify(loginData || {}));
-    return res.status(502).json({ ok: false, error: 'Hotspot login failed', detail: loginData });
+  // 3) Omada login with retry (handles transient Cloudflare/502/HTML)
+  async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+  async function loginWithRetry(max = 4) {
+    const backoffs = [250, 600, 1200, 2000];
+    for (let i = 1; i <= max; i++) {
+      log(`LOGIN attempt ${i}/${max}:`, LOGIN_URL);
+      const r = await postJson(LOGIN_URL, { name: OMADA_OPERATOR_USER, password: OMADA_OPERATOR_PASS });
+      const isHtml = typeof r.data === 'string' && r.data.includes('<html');
+      const ok = r.status === 200 && !isHtml && r.data?.errorCode === 0;
+      if (ok) return r;
+      const retryable = isHtml || (r.status >= 500 && r.status <= 599);
+      if (!retryable || i === max) {
+        err('LOGIN failed', r.status, 'detail:', typeof r.data === 'string' ? '(html)' : JSON.stringify(r.data || {}));
+        return null;
+      }
+      await sleep(backoffs[i - 1] || 1000);
+    }
+    return null;
   }
+
+  const loginResp = await loginWithRetry(4);
+  if (!loginResp) return res.status(502).json({ ok: false, error: 'Hotspot login failed (gateway)', detail: 'controller 5xx/html' });
+
+  const { data: loginData, headers: loginHeaders, cookies: loginCookies } = loginResp;
   const csrf = loginHeaders?.['csrf-token'] || loginHeaders?.['Csrf-Token'] || loginData?.result?.token || null;
   if (!csrf) return res.status(502).json({ ok: false, error: 'Login returned no CSRF token' });
 
