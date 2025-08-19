@@ -1,7 +1,7 @@
 // api/authorize.js  Vercel Node runtime, ESM style
-// Build: 2025-08-15e redis-verified
+// Build: 2025-08-19c redis-ledger-live
 
-console.log("DEBUG: authorize.js build version 2025-08-15e");
+console.log("DEBUG: authorize.js build version 2025-08-19c");
 
 export default async function handler(req, res) {
   const rid = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
@@ -30,7 +30,12 @@ export default async function handler(req, res) {
     NEXUDUS_PASS,
 
     // App timezone
-    APP_TZ = 'America/New_York'
+    APP_TZ = 'America/New_York',
+
+    // Credit config (cents)
+    BASIC_MONTHLY_CENTS = '5000',    // $50 monthly bucket
+    BASIC_SESSION_CENTS = '500',     // $5 per standard session
+    BASIC_EXTEND_CENTS  = '500'      // $5 for extend/late window
   } = process.env;
 
   if (!OMADA_BASE || !OMADA_CONTROLLER_ID || !OMADA_OPERATOR_USER || !OMADA_OPERATOR_PASS) {
@@ -69,35 +74,36 @@ export default async function handler(req, res) {
     redirectUrl
   });
 
-  // Redis ping first thing so we can see it in logs for any path
+  // Redis ping
+  let redis;
   try {
     const { getRedis } = await import('../lib/redis.js');
     log('Redis ping start');
-    const redis = await getRedis();
+    redis = await getRedis();
     const key = `w2g:auth-ping:${clientMac || 'unknown'}`;
     await redis.set(key, JSON.stringify({ when: new Date().toISOString(), site: site || '(none)' }), { EX: 300 });
     log(`Redis key set ${key}`);
   } catch (e) {
-    console.error(`[authorize][${rid}] Redis ping error`, e?.message || e);
+    console.error(`[authorize][${rid}] Redis connect error`, e?.message || e);
+    return res.status(502).json({ ok: false, error: 'Redis unavailable' });
   }
 
   if (!clientMac || !site) {
     err('Missing required fields: clientMac or site.');
     return res.status(400).json({ ok: false, error: 'Missing clientMac or site from splash redirect.' });
   }
-
   if (!email) {
     err('Missing email for Nexudus lookup.');
     return res.status(400).json({ ok: false, error: 'Email is required on the splash form.' });
   }
 
-  // axios that accepts self signed cert for Omada
+  // axios for Omada
   const http = axios.create({
     timeout: 15000,
     httpsAgent: new (https.Agent)({ rejectUnauthorized: false })
   });
 
-  // plain axios for Nexudus
+  // axios for Nexudus
   const nx = axios.create({
     baseURL: NEXUDUS_BASE.replace(/\/+$/, ''),
     timeout: 15000,
@@ -118,41 +124,6 @@ export default async function handler(req, res) {
     const r = await nx.get(url, { validateStatus: () => true });
     if (r.status !== 200) throw new Error(`Nexudus contracts HTTP ${r.status}`);
     return Array.isArray(r.data?.Records) ? r.data.Records : [];
-  }
-
-  async function nxGetMoneyBalance(coworkerId) {
-    const url = `/api/billing/moneytransactions?moneytransaction_coworker=${encodeURIComponent(coworkerId)}&_take=500`;
-    const r = await nx.get(url, { validateStatus: () => true });
-    if (r.status !== 200) throw new Error(`Nexudus moneytransactions HTTP ${r.status}`);
-    const txns = Array.isArray(r.data?.Records) ? r.data.Records : [];
-    return txns.reduce((sum, t) => sum + (Number(t.MoneyTransaction_Amount) || 0), 0);
-  }
-
-  async function nxCreateMoneyHold(coworkerId, amount, note) {
-    const payload = {
-      MoneyTransaction_Coworker: coworkerId,
-      MoneyTransaction_Amount: -Math.abs(Number(amount)),
-      MoneyTransaction_Notes: note || 'WiFi session hold',
-      MoneyTransaction_Source: 1
-    };
-    const r = await nx.post(`/api/billing/moneytransactions`, payload, { validateStatus: () => true });
-    if (r.status !== 200) throw new Error(`Hold create failed HTTP ${r.status}`);
-    return r.data;
-  }
-
-  async function nxRefundMoneyHold(hold) {
-    const coworkerId = hold.MoneyTransaction_Coworker || hold.Coworker_Id;
-    const amt = Math.abs(Number(hold.MoneyTransaction_Amount ?? hold.Amount ?? 0));
-    if (!coworkerId || !amt) throw new Error('Refund missing coworker or amount');
-    const payload = {
-      MoneyTransaction_Coworker: coworkerId,
-      MoneyTransaction_Amount: amt,
-      MoneyTransaction_Notes: `Refund of hold ${hold.Id || ''}`,
-      MoneyTransaction_Source: 1
-    };
-    const r = await nx.post(`/api/billing/moneytransactions`, payload, { validateStatus: () => true });
-    if (r.status !== 200) throw new Error(`Refund failed HTTP ${r.status}`);
-    return r.data;
   }
 
   /* ---------- Time policy for Basic ---------- */
@@ -198,10 +169,44 @@ export default async function handler(req, res) {
     return { data: resp.data, status: resp.status, cookies, headers: resp.headers };
   };
 
+  /* ---------- Redis credit ledger ---------- */
+
+  const MONTHLY_CENTS = toInt(BASIC_MONTHLY_CENTS, 5000);
+  const SESSION_CENTS = toInt(BASIC_SESSION_CENTS, 500);
+  const EXTEND_CENTS  = toInt(BASIC_EXTEND_CENTS, 500);
+
+  function localCycleKey(date = new Date()) {
+    // Use calendar month cycle key like 2025-08
+    const y = date.getFullYear();
+    const m = String(date.getMonth() + 1).padStart(2, '0');
+    return `${y}-${m}`;
+  }
+
+  function creditKeys(cycleKey, coworkerId) {
+    return {
+      ledgerKey: `w2g:credits:${cycleKey}:${coworkerId}`,
+      eventsKey: `w2g:ledger:${cycleKey}:${coworkerId}`
+    };
+  }
+
+  async function getOrInitLedger(redis, ledgerKey, seed) {
+    const existing = await redis.get(ledgerKey);
+    if (existing) {
+      try { return JSON.parse(existing); } catch { /* fall through */ }
+    }
+    await redis.set(ledgerKey, JSON.stringify(seed));
+    return seed;
+  }
+
+  function toInt(v, d) {
+    const n = Number(v);
+    return Number.isFinite(n) ? Math.round(n) : d;
+  }
+
   /* ---------- Flow ---------- */
 
   // 0) Nexudus precheck
-  let coworker, holds = [];
+  let coworker;
   try {
     coworker = await nxGetCoworkerByEmail(email);
     if (!coworker) {
@@ -211,50 +216,82 @@ export default async function handler(req, res) {
     log(`Nexudus coworker id=${coworker.Id} name=${coworker.FullName}`);
 
     const contracts = await nxGetActiveContracts(coworker.Id);
-    const hasBasic = contracts.some(c => String(c.TariffName || '').trim().toLowerCase() === 'basic');
-    log(`Active contracts=${contracts.length} hasBasic=${hasBasic}`);
+    const contractNames = contracts.map(c => String(c.TariffName || '').trim().toLowerCase());
+    const hasBasic = contractNames.some(n => n === 'basic' || n.includes('basic'));
+    const hasClassic = contractNames.some(n => n.includes('classic'));
+    const has247 = contractNames.some(n => n.includes('24') || n.includes('247'));
+    log(`Active contracts=${contracts.length} hasBasic=${hasBasic} hasClassic=${hasClassic} has247=${has247}`);
 
-    if (!hasBasic) {
-      return res.status(403).json({ ok: false, error: 'Basic plan required for this SSID' });
+    // SSID policy example: Basic SSID only for Basic/Classic/24/7
+    if ((ssidName || '').toLowerCase().includes('basic')) {
+      if (!hasBasic && !hasClassic && !has247) {
+        return res.status(403).json({ ok: false, error: 'Basic plan required for this SSID' });
+      }
+    }
+
+    if (hasBasic) {
+      const policy = computeBasicPolicy(new Date());
+      if (!policy.allowed) return res.status(403).json({ ok: false, error: policy.reason });
     }
   } catch (e) {
     err('Nexudus precheck error:', e?.message || e);
     return res.status(502).json({ ok: false, error: 'Nexudus precheck failed' });
   }
 
-  // 1) Compute Basic policy window
-  const policy = computeBasicPolicy(new Date());
-  if (!policy.allowed) return res.status(403).json({ ok: false, error: policy.reason });
+  // 1) If Basic, ensure credits are available in Redis
+  const isBasic = true; // we only reach here if Basic was allowed on this SSID; Classic/24/7 skip debits below
+  let requiredCents = 0;
+  let debitReason = 'none';
 
-  // 2) Determine holds
-  let requiredHold = 5;
-  let useExtend = extend;
-  if (policy.phase === 'standard' && extend) requiredHold = 10;
-  if (policy.phase === 'late') {
-    if (!extend) return res.status(402).json({ ok: false, error: 'Extra hour required. Select Extend to continue.' });
-    requiredHold = 5;
-    useExtend = true;
+  const policyNow = computeBasicPolicy(new Date());
+  if (!policyNow.allowed) return res.status(403).json({ ok: false, error: policyNow.reason });
+
+  if (isBasic) {
+    if (policyNow.phase === 'standard') {
+      requiredCents = SESSION_CENTS + (extend ? EXTEND_CENTS : 0);
+      debitReason = extend ? 'standard+extend' : 'standard';
+    } else {
+      // late window requires extend to continue
+      if (!extend) {
+        return res.status(402).json({ ok: false, error: 'Extra hour required. Select Extend to continue.' });
+      }
+      requiredCents = SESSION_CENTS + EXTEND_CENTS;
+      debitReason = 'late+extend';
+    }
   }
 
-  // 3) Check balance and create holds
+  let ledgerKey, eventsKey, ledger;
   try {
-    const balance = await nxGetMoneyBalance(coworker.Id);
-    log(`Money balance=${balance} requiredHold=${requiredHold}`);
-    if (balance < requiredHold) {
-      return res.status(402).json({ ok: false, error: 'Not enough credits for WiFi session' });
-    }
-    const baseHold = await nxCreateMoneyHold(coworker.Id, 5, 'WiFi session hold');
-    holds.push(baseHold);
-    if (useExtend) {
-      const extHold = await nxCreateMoneyHold(coworker.Id, 5, 'WiFi extra hour hold');
-      holds.push(extHold);
+    const cycleKey = localCycleKey(new Date());
+    const keys = creditKeys(cycleKey, coworker.Id);
+    ledgerKey = keys.ledgerKey;
+    eventsKey = keys.eventsKey;
+
+    const seed = {
+      coworkerId: coworker.Id,
+      email,
+      plan: 'basic',
+      cycle: cycleKey,
+      remainingCents: MONTHLY_CENTS,
+      spentCents: 0,
+      checkins: 0,
+      lastUpdated: new Date().toISOString()
+    };
+
+    ledger = await getOrInitLedger(redis, ledgerKey, seed);
+
+    if (isBasic) {
+      if (Number(ledger.remainingCents) < requiredCents) {
+        log(`Insufficient credits remaining=${ledger.remainingCents} required=${requiredCents}`);
+        return res.status(402).json({ ok: false, error: 'Not enough credits for WiFi session' });
+      }
     }
   } catch (e) {
-    err('Money hold error:', e?.message || e);
-    return res.status(502).json({ ok: false, error: 'Unable to place credit hold' });
+    err('Ledger init error:', e?.message || e);
+    return res.status(502).json({ ok: false, error: 'Credit ledger unavailable' });
   }
 
-  // 4) Omada hotspot login
+  // 2) Omada hotspot login
   log('LOGIN try:', LOGIN_URL);
   const loginPayload = { name: OMADA_OPERATOR_USER, password: OMADA_OPERATOR_PASS };
 
@@ -263,7 +300,6 @@ export default async function handler(req, res) {
 
   if (loginStatus !== 200 || loginData?.errorCode !== 0) {
     err('LOGIN failed', loginStatus, 'detail:', JSON.stringify(loginData || {}));
-    await refundAll(holds, nxRefundMoneyHold, err);
     return res.status(502).json({ ok: false, error: 'Hotspot login failed', detail: loginData });
   }
 
@@ -274,18 +310,17 @@ export default async function handler(req, res) {
 
   if (!csrf) {
     err('LOGIN ok but missing CSRF token');
-    await refundAll(holds, nxRefundMoneyHold, err);
     return res.status(502).json({ ok: false, error: 'Login returned no CSRF token' });
   }
 
-  // 5) Omada authorize until policy cutoff
+  // 3) Omada authorize until policy cutoff
   const payload = {
     clientMac,
     apMac,
     ssidName,
     radioId: radioIdRaw ? Number(radioIdRaw) : 1,
     site,
-    time: String(Math.max(60000, policy.msRemaining)),
+    time: String(Math.max(60000, policyNow.msRemaining)),
     authType: 4
   };
 
@@ -295,20 +330,54 @@ export default async function handler(req, res) {
   const { data: authData, status: authStatus } =
     await postJson(AUTH_URL, payload, { 'Csrf-Token': csrf, ...cookieHeader });
 
-  if (authStatus === 200 && authData?.errorCode === 0) {
-    log('AUTH success -> redirect', redirectUrl, 'cutoff:', policy.cutoffISO, 'extended:', useExtend);
-    return res.status(200).json({ ok: true, redirectUrl, cutoff: policy.cutoffISO, extended: useExtend });
+  if (!(authStatus === 200 && authData?.errorCode === 0)) {
+    err('AUTH failed status', authStatus, 'detail:', JSON.stringify(authData || {}));
+    return res.status(502).json({ ok: false, error: 'Authorization failed', detail: authData });
   }
 
-  err('AUTH failed status', authStatus, 'detail:', JSON.stringify(authData || {}));
-  await refundAll(holds, nxRefundMoneyHold, err);
-  return res.status(502).json({ ok: false, error: 'Authorization failed', detail: authData });
+  // 4) Record successful check-in and apply debit (only after Omada success)
+  try {
+    const event = {
+      when: new Date().toISOString(),
+      clientMac,
+      apMac,
+      ssidName,
+      site,
+      durationMs: Math.max(60000, policyNow.msRemaining),
+      phase: policyNow.phase,
+      extend: !!extend,
+      debitCents: isBasic ? requiredCents : 0,
+      reason: debitReason
+    };
+
+    if (isBasic) {
+      ledger.remainingCents = Math.max(0, Number(ledger.remainingCents) - requiredCents);
+      ledger.spentCents = Number(ledger.spentCents) + requiredCents;
+    }
+    ledger.checkins = Number(ledger.checkins) + 1;
+    ledger.lastUpdated = new Date().toISOString();
+
+    await redis.set(ledgerKey, JSON.stringify(ledger));
+    await redis.lpush(eventsKey, JSON.stringify(event));
+    log(`Ledger updated ${ledgerKey} remaining=${ledger.remainingCents} spent=${ledger.spentCents}`);
+  } catch (e) {
+    err('Ledger write error:', e?.message || e);
+    // Do not revoke Omada on write failure; log for later reconciliation
+  }
+
+  // 5) Success response
+  log('AUTH success -> redirect', redirectUrl);
+  return res.status(200).json({
+    ok: true,
+    redirectUrl,
+    cutoff: policyNow.cutoffISO,
+    extended: !!extend
+  });
 }
 
 /* ---------- utils ---------- */
 
-async function refundAll(holds, refundFn, logErr) {
-  for (const h of holds) {
-    try { await refundFn(h); } catch (e) { logErr('Refund error', e?.message || e); }
-  }
+function setLocalTime(d, hh, mm, ss) {
+  d.setHours(hh, mm, ss, 0);
+  return d;
 }
