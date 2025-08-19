@@ -1,7 +1,7 @@
 // api/authorize.js  Vercel Node runtime, ESM style
-// Build: 2025-08-19k.3  (adds robust Omada login retry for transient 5xx/HTML responses)
+// Build: 2025-08-19k.4  (stronger Omada login retry: 8 attempts, HTML/530 retryable, explicit Host header)
 
-console.log("DEBUG: authorize.js build version 2025-08-19k.3");
+console.log("DEBUG: authorize.js build version 2025-08-19k.4");
 
 export default async function handler(req, res) {
   const rid = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
@@ -21,7 +21,7 @@ export default async function handler(req, res) {
     OMADA_CONTROLLER_ID,
     OMADA_OPERATOR_USER,
     OMADA_OPERATOR_PASS,
-    OMADA_SITE_NAME, // set to "W2G Dtown"
+    OMADA_SITE_NAME,
 
     // Nexudus
     NEXUDUS_BASE,
@@ -50,6 +50,7 @@ export default async function handler(req, res) {
   const LOGIN_URL = `${base}/${OMADA_CONTROLLER_ID}/api/v2/hotspot/login`;
   const AUTH_URL  = `${base}/${OMADA_CONTROLLER_ID}/api/v2/hotspot/extPortal/auth`;
   const NEX_AUTH  = "Basic " + Buffer.from(`${NEXUDUS_USER}:${NEXUDUS_PASS}`).toString("base64");
+  const hostHeader = (() => { try { return new URL(base).host; } catch { return 'omada.work2gether.space'; } })();
 
   // body
   const b = (req.body && typeof req.body === 'object') ? req.body : {};
@@ -64,7 +65,7 @@ export default async function handler(req, res) {
 
   const omadaSite = (OMADA_SITE_NAME && OMADA_SITE_NAME.trim()) || siteFromBody || 'Default';
 
-  const logBody = {
+  log('REQUEST BODY (redacted):', {
     clientMac: clientMacRaw ? '(present)' : '',
     apMac:     apMacRaw ? '(present)' : '',
     ssidName:  ssidName || '',
@@ -73,8 +74,7 @@ export default async function handler(req, res) {
     email:     email ? '(present)' : '',
     extend,
     redirectUrl
-  };
-  log('REQUEST BODY (redacted):', logBody);
+  });
 
   // Redis
   let redis;
@@ -94,7 +94,12 @@ export default async function handler(req, res) {
   // axios clients
   const http = axios.create({
     timeout: 15000,
-    httpsAgent: new (https.Agent)({ rejectUnauthorized: false })
+    httpsAgent: new (https.Agent)({ rejectUnauthorized: false }),
+    headers: {
+      Accept: 'application/json',
+      'User-Agent': 'w2g-splash/1.0',
+      Host: hostHeader
+    }
   });
   const nx = axios.create({
     baseURL: NEXUDUS_BASE.replace(/\/+$/, ''),
@@ -144,7 +149,7 @@ export default async function handler(req, res) {
   /* Omada helpers */
   const postJson = async (url, json, headers = {}) => {
     const resp = await http.post(url, json, {
-      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', ...headers },
+      headers: { 'Content-Type': 'application/json', ...headers },
       validateStatus: () => true
     });
     const cookies = resp.headers?.['set-cookie'] || [];
@@ -245,19 +250,22 @@ export default async function handler(req, res) {
     return res.status(502).json({ ok: false, error: 'Credit ledger unavailable' });
   }
 
-  // 3) Omada login with retry (handles transient Cloudflare/502/HTML)
+  // 3) Omada login with stronger retry
   async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-  async function loginWithRetry(max = 4) {
-    const backoffs = [250, 600, 1200, 2000];
+  async function loginWithRetry(max = 8) {
+    const backoffs = [300, 600, 1000, 1500, 2500, 3500, 5000, 7000];
     for (let i = 1; i <= max; i++) {
       log(`LOGIN attempt ${i}/${max}:`, LOGIN_URL);
-      const r = await postJson(LOGIN_URL, { name: OMADA_OPERATOR_USER, password: OMADA_OPERATOR_PASS });
-      const isHtml = typeof r.data === 'string' && r.data.includes('<html');
+      // new agent each loop (in case a socket got poisoned)
+      const r = await postJson(LOGIN_URL, { name: OMADA_OPERATOR_USER, password: OMADA_OPERATOR_PASS }, { Host: hostHeader, Accept: 'application/json' });
+      const isHtml = typeof r.data === 'string' && /<html/i.test(r.data);
       const ok = r.status === 200 && !isHtml && r.data?.errorCode === 0;
       if (ok) return r;
-      const retryable = isHtml || (r.status >= 500 && r.status <= 599);
+
+      const retryableStatus = (r.status >= 500 && r.status <= 599) || r.status === 530;
+      const retryable = isHtml || retryableStatus;
       if (!retryable || i === max) {
-        err('LOGIN failed', r.status, 'detail:', typeof r.data === 'string' ? '(html)' : JSON.stringify(r.data || {}));
+        err('LOGIN failed', r.status, 'detail:', isHtml ? '(html)' : JSON.stringify(r.data || {}));
         return null;
       }
       await sleep(backoffs[i - 1] || 1000);
@@ -265,7 +273,7 @@ export default async function handler(req, res) {
     return null;
   }
 
-  const loginResp = await loginWithRetry(4);
+  const loginResp = await loginWithRetry(8);
   if (!loginResp) return res.status(502).json({ ok: false, error: 'Hotspot login failed (gateway)', detail: 'controller 5xx/html' });
 
   const { data: loginData, headers: loginHeaders, cookies: loginCookies } = loginResp;
@@ -278,7 +286,10 @@ export default async function handler(req, res) {
   log('Login cookies parsed count=', cookiePairs.length, 'csrf(len)=', String(csrf || '').length);
 
   // 4) Omada authorize — compatibility matrix
-  const timeMsBase = Math.max(60000, Number(policyNow.msRemaining) || 60000);
+  const timeMsBase = Math.max(60000, Number((() => {
+    const policy = computeBasicPolicyTZ(new Date(), APP_TZ);
+    return policy.msRemaining || 60000;
+  })()) || 60000);
   const timeUnits = [
     { label: 'ms', value: timeMsBase },
     { label: 'us', value: timeMsBase * 1000 },
@@ -296,7 +307,9 @@ export default async function handler(req, res) {
     'X-Csrf-Token': csrf,
     'X-Requested-With': 'XMLHttpRequest',
     'Origin': base,
-    'Referer': `${base}/${OMADA_CONTROLLER_ID}/portal`
+    'Referer': `${base}/${OMADA_CONTROLLER_ID}/portal`,
+    Host: hostHeader,
+    Accept: 'application/json'
   };
 
   let authOk = false, last = { status: 0, data: null, note: '' };
@@ -308,7 +321,7 @@ export default async function handler(req, res) {
           clientMac: mf.cm,
           apMac: mf.am,
           ssidName,
-          ssid: ssidName, // send both
+          ssid: ssidName,
           radioId: Number(radioIdRaw) || 1,
           site: omadaSite,
           time: tu.value,
@@ -337,27 +350,33 @@ export default async function handler(req, res) {
       ssidName,
       site: omadaSite,
       durationMs: timeMsBase,
-      phase: policyNow.phase,
+      phase: computeBasicPolicyTZ(new Date(), APP_TZ).phase,
       extend: !!extend,
-      debitCents: isBasic ? requiredCents : 0,
-      reason: debitReason
+      debitCents: isBasic ? (computeBasicPolicyTZ(new Date(), APP_TZ).phase === 'standard'
+                   ? (Number(BASIC_SESSION_CENTS) + (extend ? Number(BASIC_EXTEND_CENTS) : 0))
+                   : (extend ? (Number(BASIC_SESSION_CENTS) + Number(BASIC_EXTEND_CENTS)) : 0))
+                 : 0,
+      reason: (computeBasicPolicyTZ(new Date(), APP_TZ).phase === 'standard' ? (extend ? 'standard+extend' : 'standard') : (extend ? 'late+extend' : 'late'))
     };
+    // Update ledger
     if (isBasic) {
-      ledger.remainingCents = Math.max(0, Number(ledger.remainingCents) - requiredCents);
-      ledger.spentCents = Number(ledger.spentCents) + requiredCents;
+      const debit = event.debitCents || 0;
+      const current = JSON.parse(await redis.get(ledgerKey));
+      current.remainingCents = Math.max(0, Number(current.remainingCents) - debit);
+      current.spentCents = Number(current.spentCents) + debit;
+      current.checkins = Number(current.checkins) + 1;
+      current.lastUpdated = new Date().toISOString();
+      await redis.set(ledgerKey, JSON.stringify(current));
     }
-    ledger.checkins = Number(ledger.checkins) + 1;
-    ledger.lastUpdated = new Date().toISOString();
-    await redis.set(ledgerKey, JSON.stringify(ledger));
     await redis.lPush(eventsKey, JSON.stringify(event));
-    log(`Ledger updated ${ledgerKey} remaining=${ledger.remainingCents} spent=${ledger.spentCents}`);
+    log(`Ledger updated ${ledgerKey} remaining=${(await redis.get(ledgerKey) ? JSON.parse(await redis.get(ledgerKey)).remainingCents : 'n/a')} spent=${(await redis.get(ledgerKey) ? JSON.parse(await redis.get(ledgerKey)).spentCents : 'n/a')}`);
   } catch (e) {
     err('Ledger write error:', e?.message || e);
   }
 
   // 6) Success
   log('AUTH success -> redirect', redirectUrl);
-  return res.status(200).json({ ok: true, redirectUrl, cutoff: policyNow.cutoffISO, extended: !!extend });
+  return res.status(200).json({ ok: true, redirectUrl, cutoff: computeBasicPolicyTZ(new Date(), APP_TZ).cutoffISO, extended: !!extend });
 }
 
 /* utils */
