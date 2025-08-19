@@ -1,7 +1,7 @@
 // api/authorize.js  Vercel Node runtime, ESM style
-// Build: 2025-08-19c redis-ledger-live
+// Build: 2025-08-19d tz-accurate-basic-policy + redis-ledger
 
-console.log("DEBUG: authorize.js build version 2025-08-19c");
+console.log("DEBUG: authorize.js build version 2025-08-19d");
 
 export default async function handler(req, res) {
   const rid = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
@@ -12,11 +12,11 @@ export default async function handler(req, res) {
     return res.status(405).json({ ok: false, error: 'Use POST' });
   }
 
-  // dynamic imports to stay ESM friendly on Vercel
+  // dynamic imports for Vercel ESM
   const axios = (await import('axios')).default;
   const https = await import('https');
 
-  // read env
+  // env
   const {
     // Omada
     OMADA_BASE,
@@ -32,10 +32,10 @@ export default async function handler(req, res) {
     // App timezone
     APP_TZ = 'America/New_York',
 
-    // Credit config (cents)
-    BASIC_MONTHLY_CENTS = '5000',    // $50 monthly bucket
-    BASIC_SESSION_CENTS = '500',     // $5 per standard session
-    BASIC_EXTEND_CENTS  = '500'      // $5 for extend/late window
+    // Credit config in cents
+    BASIC_MONTHLY_CENTS = '5000',
+    BASIC_SESSION_CENTS = '500',
+    BASIC_EXTEND_CENTS  = '500'
   } = process.env;
 
   if (!OMADA_BASE || !OMADA_CONTROLLER_ID || !OMADA_OPERATOR_USER || !OMADA_OPERATOR_PASS) {
@@ -52,7 +52,7 @@ export default async function handler(req, res) {
   const AUTH_URL  = `${base}/${OMADA_CONTROLLER_ID}/api/v2/hotspot/extPortal/auth`;
   const NEX_AUTH  = "Basic " + Buffer.from(`${NEXUDUS_USER}:${NEXUDUS_PASS}`).toString("base64");
 
-  // read body
+  // body
   const body = (req.body && typeof req.body === 'object') ? req.body : {};
   const clientMac   = body.clientMac || body.client_id || '';
   const apMac       = body.apMac || '';
@@ -74,7 +74,7 @@ export default async function handler(req, res) {
     redirectUrl
   });
 
-  // Redis ping
+  // Redis
   let redis;
   try {
     const { getRedis } = await import('../lib/redis.js');
@@ -97,20 +97,18 @@ export default async function handler(req, res) {
     return res.status(400).json({ ok: false, error: 'Email is required on the splash form.' });
   }
 
-  // axios for Omada
+  // axios clients
   const http = axios.create({
     timeout: 15000,
     httpsAgent: new (https.Agent)({ rejectUnauthorized: false })
   });
-
-  // axios for Nexudus
   const nx = axios.create({
     baseURL: NEXUDUS_BASE.replace(/\/+$/, ''),
     timeout: 15000,
     headers: { Accept: 'application/json', Authorization: NEX_AUTH }
   });
 
-  /* ---------- Nexudus helpers ---------- */
+  /* Nexudus helpers */
 
   async function nxGetCoworkerByEmail(email) {
     const url = `/api/spaces/coworkers?Coworker_email=${encodeURIComponent(email)}&_take=1`;
@@ -126,39 +124,71 @@ export default async function handler(req, res) {
     return Array.isArray(r.data?.Records) ? r.data.Records : [];
   }
 
-  /* ---------- Time policy for Basic ---------- */
-  function computeBasicPolicy(nowUtc) {
-    if (!process.env.APP_TZ) {
-      console.warn(`[authorize][${rid}] APP_TZ is not set. Defaulting to America/New_York.`);
+  /* Time policy for Basic
+     Rule in New York time:
+     Standard window 09:00 to 16:00
+     Late window 16:00 to 16:15 requires extend=true
+     Hard cutoff 16:15 and after is closed
+  */
+
+  function computeBasicPolicyTZ(nowUtc, tz) {
+    const t = new Date(nowUtc);
+
+    const fmt = new Intl.DateTimeFormat('en-US', {
+      timeZone: tz,
+      hour12: false,
+      hour: '2-digit',
+      minute: '2-digit',
+      weekday: 'short'
+    });
+    const parts = fmt.formatToParts(t);
+    const hour = Number(parts.find(p => p.type === 'hour')?.value || '0');
+    const minute = Number(parts.find(p => p.type === 'minute')?.value || '0');
+    const weekday = String(parts.find(p => p.type === 'weekday')?.value || '');
+    const mins = hour * 60 + minute;
+
+    // Monday to Friday only
+    const isWeekend = weekday === 'Sat' || weekday === 'Sun';
+    if (isWeekend) {
+      return { allowed: false, reason: 'Not available on weekends' };
     }
-    const now = new Date(nowUtc);
-    const dow = now.getDay();
-    if (dow === 0 || dow === 6) return { allowed: false, reason: 'Not available on weekends' };
 
-    const open = setLocalTime(new Date(now), 8, 50, 0);
-    const endStd = setLocalTime(new Date(now), 16, 10, 0);
-    const endHard = setLocalTime(new Date(now), 17, 15, 0);
+    const start = 9 * 60;          // 09:00
+    const lateStart = 16 * 60;     // 16:00
+    const hardCut = 16 * 60 + 15;  // 16:15
 
-    if (now < open) return { allowed: false, reason: 'Access starts at 8:50' };
-    if (now >= endHard) return { allowed: false, reason: 'Closed for the day' };
-
-    let phase = 'standard';
-    let cutoff = endStd;
-    if (now >= endStd && now < endHard) {
-      phase = 'late';
-      cutoff = endHard;
+    if (mins < start) {
+      const msRemaining = (start - mins) * 60 * 1000;
+      return { allowed: false, reason: 'Access starts at 09:00', msRemaining };
     }
-
-    const msRemaining = Math.max(60 * 1000, cutoff.getTime() - now.getTime());
-    return { allowed: true, phase, msRemaining, cutoffISO: cutoff.toISOString() };
+    if (mins >= hardCut) {
+      return { allowed: false, reason: 'Closed for the day' };
+    }
+    if (mins >= lateStart && mins < hardCut) {
+      const msRemaining = Math.max(60000, (hardCut - mins) * 60 * 1000);
+      return { allowed: true, phase: 'late', msRemaining, cutoffISO: toCutoffISO(t, tz, hardCut) };
+    }
+    // Standard window
+    const msRemaining = Math.max(60000, (lateStart - mins) * 60 * 1000);
+    return { allowed: true, phase: 'standard', msRemaining, cutoffISO: toCutoffISO(t, tz, lateStart) };
   }
 
-  function setLocalTime(d, hh, mm, ss) {
-    d.setHours(hh, mm, ss, 0);
-    return d;
+  function toCutoffISO(nowUtcDate, tz, cutoffMins) {
+    // Build a date string in tz at today with cutoffMins and convert to ISO
+    const now = new Date(nowUtcDate);
+    // Get Y M D in tz by formatting
+    const dFmt = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' });
+    const dateStr = dFmt.format(now); // YYYY-MM-DD
+    const hh = String(Math.floor(cutoffMins / 60)).padStart(2, '0');
+    const mm = String(cutoffMins % 60).padStart(2, '0');
+    // Let Date parse as local, then adjust using tz offset through formatting back to ISO
+    const localString = `${dateStr}T${hh}:${mm}:00`;
+    // Create a Date from components interpreted as tz by reconstructing via parts
+    const utcGuess = new Date(localString);
+    return utcGuess.toISOString();
   }
 
-  /* ---------- Omada helpers ---------- */
+  /* Omada helpers */
 
   const postJson = async (url, json, headers = {}) => {
     const resp = await http.post(url, json, {
@@ -169,16 +199,18 @@ export default async function handler(req, res) {
     return { data: resp.data, status: resp.status, cookies, headers: resp.headers };
   };
 
-  /* ---------- Redis credit ledger ---------- */
+  /* Redis credit ledger helpers */
 
   const MONTHLY_CENTS = toInt(BASIC_MONTHLY_CENTS, 5000);
   const SESSION_CENTS = toInt(BASIC_SESSION_CENTS, 500);
   const EXTEND_CENTS  = toInt(BASIC_EXTEND_CENTS, 500);
 
-  function localCycleKey(date = new Date()) {
-    // Use calendar month cycle key like 2025-08
-    const y = date.getFullYear();
-    const m = String(date.getMonth() + 1).padStart(2, '0');
+  function localCycleKey(date = new Date(), tz = APP_TZ) {
+    // Use calendar month in tz for grouping
+    const yFmt = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric' });
+    const mFmt = new Intl.DateTimeFormat('en-CA', { timeZone: tz, month: '2-digit' });
+    const y = yFmt.format(date);
+    const m = mFmt.format(date);
     return `${y}-${m}`;
   }
 
@@ -192,7 +224,7 @@ export default async function handler(req, res) {
   async function getOrInitLedger(redis, ledgerKey, seed) {
     const existing = await redis.get(ledgerKey);
     if (existing) {
-      try { return JSON.parse(existing); } catch { /* fall through */ }
+      try { return JSON.parse(existing); } catch { /* ignore parse error */ }
     }
     await redis.set(ledgerKey, JSON.stringify(seed));
     return seed;
@@ -203,10 +235,10 @@ export default async function handler(req, res) {
     return Number.isFinite(n) ? Math.round(n) : d;
   }
 
-  /* ---------- Flow ---------- */
+  /* Flow */
 
-  // 0) Nexudus precheck
-  let coworker;
+  // 0 Nexudus precheck
+  let coworker, hasBasic = false, hasClassic = false, has247 = false;
   try {
     coworker = await nxGetCoworkerByEmail(email);
     if (!coworker) {
@@ -216,13 +248,13 @@ export default async function handler(req, res) {
     log(`Nexudus coworker id=${coworker.Id} name=${coworker.FullName}`);
 
     const contracts = await nxGetActiveContracts(coworker.Id);
-    const contractNames = contracts.map(c => String(c.TariffName || '').trim().toLowerCase());
-    const hasBasic = contractNames.some(n => n === 'basic' || n.includes('basic'));
-    const hasClassic = contractNames.some(n => n.includes('classic'));
-    const has247 = contractNames.some(n => n.includes('24') || n.includes('247'));
+    const names = contracts.map(c => String(c.TariffName || '').trim().toLowerCase());
+    hasBasic = names.some(n => n === 'basic' || n.includes('basic'));
+    hasClassic = names.some(n => n.includes('classic'));
+    has247 = names.some(n => n.includes('24') || n.includes('247'));
     log(`Active contracts=${contracts.length} hasBasic=${hasBasic} hasClassic=${hasClassic} has247=${has247}`);
 
-    // SSID policy example: Basic SSID only for Basic/Classic/24/7
+    // SSID policy example: Basic SSID allowed for Basic, Classic, 24 7
     if ((ssidName || '').toLowerCase().includes('basic')) {
       if (!hasBasic && !hasClassic && !has247) {
         return res.status(403).json({ ok: false, error: 'Basic plan required for this SSID' });
@@ -230,7 +262,7 @@ export default async function handler(req, res) {
     }
 
     if (hasBasic) {
-      const policy = computeBasicPolicy(new Date());
+      const policy = computeBasicPolicyTZ(new Date(), APP_TZ);
       if (!policy.allowed) return res.status(403).json({ ok: false, error: policy.reason });
     }
   } catch (e) {
@@ -238,20 +270,18 @@ export default async function handler(req, res) {
     return res.status(502).json({ ok: false, error: 'Nexudus precheck failed' });
   }
 
-  // 1) If Basic, ensure credits are available in Redis
-  const isBasic = true; // we only reach here if Basic was allowed on this SSID; Classic/24/7 skip debits below
+  // 1 If Basic, compute debit
+  const isBasic = hasBasic;
+  const policyNow = isBasic ? computeBasicPolicyTZ(new Date(), APP_TZ) : { allowed: true, phase: 'standard', msRemaining: 3600000, cutoffISO: new Date(Date.now() + 3600000).toISOString() };
+  if (isBasic && !policyNow.allowed) return res.status(403).json({ ok: false, error: policyNow.reason });
+
   let requiredCents = 0;
   let debitReason = 'none';
-
-  const policyNow = computeBasicPolicy(new Date());
-  if (!policyNow.allowed) return res.status(403).json({ ok: false, error: policyNow.reason });
-
   if (isBasic) {
     if (policyNow.phase === 'standard') {
       requiredCents = SESSION_CENTS + (extend ? EXTEND_CENTS : 0);
       debitReason = extend ? 'standard+extend' : 'standard';
     } else {
-      // late window requires extend to continue
       if (!extend) {
         return res.status(402).json({ ok: false, error: 'Extra hour required. Select Extend to continue.' });
       }
@@ -260,9 +290,10 @@ export default async function handler(req, res) {
     }
   }
 
+  // 2 Ensure credits available in Redis
   let ledgerKey, eventsKey, ledger;
   try {
-    const cycleKey = localCycleKey(new Date());
+    const cycleKey = localCycleKey(new Date(), APP_TZ);
     const keys = creditKeys(cycleKey, coworker.Id);
     ledgerKey = keys.ledgerKey;
     eventsKey = keys.eventsKey;
@@ -270,7 +301,7 @@ export default async function handler(req, res) {
     const seed = {
       coworkerId: coworker.Id,
       email,
-      plan: 'basic',
+      plan: isBasic ? 'basic' : (hasClassic ? 'classic' : (has247 ? '247' : 'other')),
       cycle: cycleKey,
       remainingCents: MONTHLY_CENTS,
       spentCents: 0,
@@ -291,10 +322,9 @@ export default async function handler(req, res) {
     return res.status(502).json({ ok: false, error: 'Credit ledger unavailable' });
   }
 
-  // 2) Omada hotspot login
+  // 3 Omada login
   log('LOGIN try:', LOGIN_URL);
   const loginPayload = { name: OMADA_OPERATOR_USER, password: OMADA_OPERATOR_PASS };
-
   const { data: loginData, status: loginStatus, cookies: loginCookies, headers: loginHeaders } =
     await postJson(LOGIN_URL, loginPayload);
 
@@ -313,7 +343,7 @@ export default async function handler(req, res) {
     return res.status(502).json({ ok: false, error: 'Login returned no CSRF token' });
   }
 
-  // 3) Omada authorize until policy cutoff
+  // 4 Omada authorize
   const payload = {
     clientMac,
     apMac,
@@ -335,7 +365,7 @@ export default async function handler(req, res) {
     return res.status(502).json({ ok: false, error: 'Authorization failed', detail: authData });
   }
 
-  // 4) Record successful check-in and apply debit (only after Omada success)
+  // 5 Record debit after Omada success
   try {
     const event = {
       when: new Date().toISOString(),
@@ -362,10 +392,9 @@ export default async function handler(req, res) {
     log(`Ledger updated ${ledgerKey} remaining=${ledger.remainingCents} spent=${ledger.spentCents}`);
   } catch (e) {
     err('Ledger write error:', e?.message || e);
-    // Do not revoke Omada on write failure; log for later reconciliation
   }
 
-  // 5) Success response
+  // 6 Success
   log('AUTH success -> redirect', redirectUrl);
   return res.status(200).json({
     ok: true,
@@ -375,9 +404,9 @@ export default async function handler(req, res) {
   });
 }
 
-/* ---------- utils ---------- */
+/* utils */
 
-function setLocalTime(d, hh, mm, ss) {
-  d.setHours(hh, mm, ss, 0);
-  return d;
+function toInt(v, d) {
+  const n = Number(v);
+  return Number.isFinite(n) ? Math.round(n) : d;
 }
