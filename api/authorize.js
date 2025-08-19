@@ -1,7 +1,7 @@
 // api/authorize.js  Vercel Node runtime, ESM style
-// Build: 2025-08-19k.1 omada-compat-matrix + redis-ledger (lPush fix) + monthly-7500
+// Build: 2025-08-19k.2 omada-compat-matrix + redis-ledger (lPush fix) + monthly reconciliation to env cap
 
-console.log("DEBUG: authorize.js build version 2025-08-19k.1");
+console.log("DEBUG: authorize.js build version 2025-08-19k.2");
 
 export default async function handler(req, res) {
   const rid = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
@@ -219,19 +219,30 @@ export default async function handler(req, res) {
            requiredCents = SESSION_CENTS + EXTEND_CENTS; debitReason = 'late+extend'; }
   }
 
-  // 2) Ensure credits
+  // 2) Ensure credits (init + reconcile to env cap)
   let ledgerKey, eventsKey, ledger;
   try {
     const cycleKey = localCycleKey(new Date(), APP_TZ);
     ({ ledgerKey, eventsKey } = creditKeys(cycleKey, coworker.Id));
     const seed = { coworkerId: coworker.Id, email, plan: isBasic ? 'basic' : (hasClassic ? 'classic' : (has247 ? '247' : 'other')), cycle: cycleKey, remainingCents: MONTHLY_CENTS, spentCents: 0, checkins: 0, lastUpdated: new Date().toISOString() };
     ledger = await getOrInitLedger(redis, ledgerKey, seed);
+
+    // NEW: reconcile if current cap (remaining+spent) is below env BASIC_MONTHLY_CENTS
+    const currentCap = Number(ledger.remainingCents || 0) + Number(ledger.spentCents || 0);
+    if (currentCap < MONTHLY_CENTS) {
+      const bump = MONTHLY_CENTS - currentCap;
+      ledger.remainingCents = Number(ledger.remainingCents || 0) + bump;
+      ledger.lastUpdated = new Date().toISOString();
+      await redis.set(ledgerKey, JSON.stringify(ledger));
+      log(`Ledger reconciled ${ledgerKey} +${bump} to match MONTHLY_CENTS=${MONTHLY_CENTS}`);
+    }
+
     if (isBasic && Number(ledger.remainingCents) < requiredCents) {
       log(`Insufficient credits remaining=${ledger.remainingCents} required=${requiredCents}`);
       return res.status(402).json({ ok: false, error: 'Not enough credits for WiFi session' });
     }
   } catch (e) {
-    err('Ledger init error:', e?.message || e);
+    err('Ledger init/reconcile error:', e?.message || e);
     return res.status(502).json({ ok: false, error: 'Credit ledger unavailable' });
   }
 
@@ -323,7 +334,6 @@ export default async function handler(req, res) {
     ledger.checkins = Number(ledger.checkins) + 1;
     ledger.lastUpdated = new Date().toISOString();
     await redis.set(ledgerKey, JSON.stringify(ledger));
-    // FIX: node-redis v4 uses camelCase lPush
     await redis.lPush(eventsKey, JSON.stringify(event));
     log(`Ledger updated ${ledgerKey} remaining=${ledger.remainingCents} spent=${ledger.spentCents}`);
   } catch (e) {
