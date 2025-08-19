@@ -11,22 +11,18 @@
     body { display: flex; justify-content: center; align-items: center; padding: 1rem; }
     .card { border: 1px solid #ccc; padding: 2rem; border-radius: 10px; box-shadow: 0 0 15px rgba(0,0,0,0.1);
             text-align: center; width: 100%; max-width: 480px; background: #fff; display: flex; flex-direction: column; }
-    .card h1 { color: #b03b1c; margin-bottom: 1rem; font-size: 1.5rem; font-weight: 400; }
+    .card h1 { color: #b03b1c; margin-bottom: 1rem; font-size: 1.6rem; font-weight: 400; }
     .card p { margin-bottom: 1rem; font-weight: 400; }
-    form { margin: 0; }
-    .field { text-align: left; margin-bottom: 1rem; }
-    .card input[type="email"] { display: block; width: 100%; padding: 0.75rem; border: 1px solid #aaa; border-radius: 5px; font-size: 1rem; }
+    form { margin: 0; display: grid; gap: 12px; }
+    .field { text-align: left; }
+    input[type="email"] { width: 100%; padding: 0.75rem; border: 1px solid #aaa; border-radius: 5px; font-size: 1rem; }
     .row { display: flex; align-items: center; gap: .5rem; justify-content: flex-start; }
-    .card button { display: block; width: 100%; padding: 0.75rem; background: #000; color: #fff; font-size: 1rem;
-                   cursor: pointer; border: 1px solid #000; border-radius: 0; transition: background .2s,color .2s; }
-    .card button:hover { background: transparent; color: #000; }
-    .info { margin-top: 1rem; font-size: .9rem; color: #555; line-height: 1.4; }
-    .error { color: #b00020; margin-top: .75rem; font-size: .95rem; min-height: 1.2em; }
-    .debug { margin-top: 16px; text-align: left; background: #f7f7f7; border: 1px solid #e3e3e3; border-radius: 8px; padding: 12px; }
-    .debug h2 { margin: 0 0 8px 0; font-size: 1rem; }
-    .debug pre { white-space: pre-wrap; word-break: break-word; margin: 0; }
-    .debug .toolbar { display: flex; gap: 8px; margin-bottom: 8px; }
-    .warn { color: #b00; margin-top: 6px; }
+    button { width: 100%; padding: 0.75rem; background: #000; color: #fff; font-size: 1rem; cursor: pointer;
+             border: 1px solid #000; border-radius: 0; transition: background .2s, color .2s; }
+    button:hover { background: transparent; color: #000; }
+    button[disabled] { opacity: .6; cursor: not-allowed; }
+    .note { margin-top: 10px; font-size: .9rem; color: #555; }
+    .error { color: #b00020; margin-top: .5rem; min-height: 1.2em; }
     @media (max-height: 560px) { body { align-items: flex-start; padding-top: 2rem; } }
   </style>
 </head>
@@ -39,12 +35,13 @@
       <div class="field">
         <input type="email" id="email" placeholder="you@example.com" autocomplete="email" required />
       </div>
+
       <div class="field row">
         <input type="checkbox" id="extend" />
-        <label for="extend">Extend by +60 minutes (use extra credits if needed)</label>
+        <label for="extend">Extend by +60 minutes (additional deductions will apply)</label>
       </div>
 
-      <!-- Hidden passthroughs filled at runtime -->
+      <!-- Hidden passthroughs (filled at runtime) -->
       <input type="hidden" id="clientMac" />
       <input type="hidden" id="apMac" />
       <input type="hidden" id="ssidName" />
@@ -52,84 +49,58 @@
       <input type="hidden" id="site" />
       <input type="hidden" id="redirectUrl" />
 
-      <button type="submit">Continue</button>
+      <button id="submitBtn" type="submit">Continue</button>
+      <div class="error" id="error" role="alert" aria-live="polite"></div>
+      <div class="note">Your time of access may use standard or late credits depending on the clock. Log out when finished.</div>
     </form>
-
-    <div class="info">
-      Your time of access may use standard or late credits depending on the clock. Log out when finished.
-    </div>
-    <div class="error" id="error" role="alert" aria-live="polite"></div>
-
-    <div class="debug">
-      <div class="toolbar">
-        <button id="copyPayload" type="button">Copy payload JSON</button>
-        <button id="copyCurl" type="button">Copy curl (for immediate retest)</button>
-      </div>
-      <h2>Omada parameters detected</h2>
-      <pre id="paramsBox">{}</pre>
-      <div id="missingBox" class="warn"></div>
-      <h2 style="margin-top: 10px;">Last authorize result</h2>
-      <pre id="resultBox">No attempts yet.</pre>
-    </div>
   </div>
 
   <script>
-    // Read query params with fallbacks Omada commonly uses
+    // Read Omada query params (with common fallbacks)
     const qs = new URLSearchParams(location.search);
     const get = (k) => qs.get(k) || '';
-    const firstNonEmpty = (...names) => {
-      for (const n of names) { const v = get(n); if (v) return v; }
-      return '';
-    };
+    const first = (...names) => { for (const n of names) { const v = get(n); if (v) return v; } return ''; };
 
     const params = {
-      clientMac: firstNonEmpty('clientMac', 'client_id'),
-      apMac: firstNonEmpty('apMac', 'gatewayMac'),
-      ssidName: firstNonEmpty('ssidName', 'ssid'),
-      radioId: firstNonEmpty('radioId', 'radio'),
+      clientMac: first('clientMac', 'client_id'),
+      apMac: first('apMac', 'gatewayMac'),
+      ssidName: first('ssidName', 'ssid'),
+      radioId: first('radioId', 'radio'),
       site: get('site'),
-      redirectUrl: (function () {
+      redirectUrl: (() => {
         const r = get('redirectUrl');
-        try { return r ? decodeURIComponent(r) : 'http://neverssl.com'; } catch { return 'http://neverssl.com'; }
-      })(),
-      t: get('t')
+        try { return r ? decodeURIComponent(r) : 'http://neverssl.com'; }
+        catch { return 'http://neverssl.com'; }
+      })()
     };
 
-    // Populate hidden inputs for the POST
-    function fillHidden() {
-      document.getElementById('clientMac').value = params.clientMac;
-      document.getElementById('apMac').value = params.apMac;
-      document.getElementById('ssidName').value = params.ssidName;
-      document.getElementById('radioId').value = params.radioId;
-      document.getElementById('site').value = params.site;
-      document.getElementById('redirectUrl').value = params.redirectUrl;
-    }
-    fillHidden();
+    // Fill hidden inputs
+    document.getElementById('clientMac').value = params.clientMac;
+    document.getElementById('apMac').value = params.apMac;
+    document.getElementById('ssidName').value = params.ssidName;
+    document.getElementById('radioId').value = params.radioId;
+    document.getElementById('site').value = params.site;
+    document.getElementById('redirectUrl').value = params.redirectUrl;
 
-    // Show params + indicate what’s missing (if any)
-    const paramsBox = document.getElementById('paramsBox');
-    paramsBox.textContent = JSON.stringify(params, null, 2);
-
-    const missing = [];
-    if (!params.clientMac) missing.push('clientMac');
-    if (!params.apMac)     missing.push('apMac/gatewayMac');
-    if (!params.ssidName)  missing.push('ssidName/ssid');
-    if (params.radioId === '') missing.push('radioId/radio');
-    if (!params.site)      missing.push('site');
-
-    const missingBox = document.getElementById('missingBox');
-    if (missing.length) {
-      missingBox.textContent = 'Missing from redirect: ' + missing.join(', ')
-        + ' — connect to the real W2G_Basic SSID and try again.';
+    // If not on the Wi-Fi (missing essentials), disable submit with a friendly hint
+    const essentialsMissing = !params.clientMac || !params.apMac || !params.ssidName || params.radioId === '' || !params.site;
+    const submitBtn = document.getElementById('submitBtn');
+    const errorDiv = document.getElementById('error');
+    if (essentialsMissing) {
+      submitBtn.disabled = true;
+      errorDiv.textContent = 'Please connect to the W2G_Basic Wi-Fi and try again.';
     }
 
-    const errorDiv = document.getElementById("error");
-    const resultBox = document.getElementById("resultBox");
+    // Submit handler
+    document.getElementById('loginForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      if (submitBtn.disabled) return;
+      errorDiv.textContent = '';
+      submitBtn.disabled = true;
+      submitBtn.textContent = 'Authorizing…';
 
-    document.getElementById("copyPayload").addEventListener("click", () => {
-      const email = document.getElementById("email").value.trim() || 'you@example.com';
       const payload = {
-        email,
+        email: document.getElementById('email').value.trim(),
         clientMac: params.clientMac,
         apMac: params.apMac,
         ssidName: params.ssidName,
@@ -138,72 +109,28 @@
         redirectUrl: params.redirectUrl,
         extend: document.getElementById('extend').checked
       };
-      navigator.clipboard.writeText(JSON.stringify(payload, null, 2));
-    });
-
-    document.getElementById("copyCurl").addEventListener("click", () => {
-      const email = document.getElementById("email").value.trim() || 'you@example.com';
-      const extend = document.getElementById('extend').checked ? 'true' : 'false';
-      const payload = {
-        email,
-        clientMac: params.clientMac,
-        apMac: params.apMac,
-        ssidName: params.ssidName,
-        radioId: params.radioId ? Number(params.radioId) : undefined,
-        site: params.site,
-        redirectUrl: params.redirectUrl,
-        extend: extend === 'true'
-      };
-      const body = JSON.stringify(payload).replace(/"/g, '\\"');
-      const curl = [
-        'curl -k -X POST https://splash.work2gether.space/api/authorize ^',
-        '  -H "Content-Type: application/json" ^',
-        `  -d "${body}"`
-      ].join('\n');
-      navigator.clipboard.writeText(curl);
-      alert('Copied curl. Run it immediately while the client is pending.');
-    });
-
-    document.getElementById("loginForm").addEventListener("submit", async (e) => {
-      e.preventDefault();
-      errorDiv.textContent = "";
-      resultBox.textContent = "Authorizing…";
-
-      const email = document.getElementById("email").value.trim();
-      const extend = document.getElementById("extend").checked;
-
-      const payload = {
-        email,
-        clientMac: params.clientMac,
-        apMac: params.apMac,
-        ssidName: params.ssidName,
-        radioId: params.radioId ? Number(params.radioId) : undefined,
-        site: params.site,
-        redirectUrl: params.redirectUrl,
-        extend
-      };
 
       try {
-        const res = await fetch("/api/authorize", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
+        const res = await fetch('/api/authorize', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload)
         });
         const txt = await res.text();
         let data = {};
         try { data = JSON.parse(txt); } catch {}
-        if (!res.ok || !data.ok) {
-          errorDiv.textContent = data.error || "Authorize failed. Try again.";
+
+        if (res.ok && data.ok && data.redirectUrl) {
+          location.href = data.redirectUrl;
+          return;
         }
-        resultBox.textContent = JSON.stringify({ status: res.status, body: data }, null, 2);
-        if (data.ok && data.redirectUrl) {
-          // Uncomment to auto-redirect on success:
-          // location.href = data.redirectUrl;
-        }
+
+        errorDiv.textContent = (data && data.error) ? data.error : 'Authorize failed. Try again.';
       } catch (err) {
-        console.error("[SPLASH] submit error", err);
-        errorDiv.textContent = "Network error. Try again.";
-        resultBox.textContent = JSON.stringify({ ok: false, error: String(err) }, null, 2);
+        errorDiv.textContent = 'Network error. Try again.';
+      } finally {
+        submitBtn.disabled = false;
+        submitBtn.textContent = 'Continue';
       }
     });
   </script>
