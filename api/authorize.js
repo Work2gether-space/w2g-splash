@@ -1,7 +1,7 @@
 // api/authorize.js  Vercel Node runtime, ESM style
-// Build: 2025-08-19h auth-headers+csrf-cookie + cookie-fix + tz-accurate-basic-policy + redis-ledger + monthly-7500
+// Build: 2025-08-19i site-name+mac-colons+time-us + redis-ledger + monthly-7500
 
-console.log("DEBUG: authorize.js build version 2025-08-19h");
+console.log("DEBUG: authorize.js build version 2025-08-19i");
 
 export default async function handler(req, res) {
   const rid = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
@@ -23,6 +23,7 @@ export default async function handler(req, res) {
     OMADA_CONTROLLER_ID,
     OMADA_OPERATOR_USER,
     OMADA_OPERATOR_PASS,
+    OMADA_SITE_NAME, // <= set this to "W2G Dtown" in Vercel env
 
     // Nexudus
     NEXUDUS_BASE,
@@ -53,22 +54,29 @@ export default async function handler(req, res) {
   const NEX_AUTH  = "Basic " + Buffer.from(`${NEXUDUS_USER}:${NEXUDUS_PASS}`).toString("base64");
 
   // body
-  const body = (req.body && typeof req.body === 'object') ? req.body : {};
-  const clientMac   = normalizeMac(body.clientMac || body.client_id || '');
-  const apMac       = normalizeMac(body.apMac || '');
-  const ssidName    = body.ssidName || body.ssid || '';
-  const radioIdRaw  = body.radioId || body.radio || '';
-  const site        = body.site || '';
-  const redirectUrl = body.redirectUrl || 'http://neverssl.com';
-  const email       = body.email || '';
-  const extend      = !!body.extend;
+  const rawBody = typeof req.body === 'object' ? req.body : {};
+  const clientMacRaw = rawBody.clientMac || rawBody.client_id || '';
+  const apMacRaw     = rawBody.apMac || '';
+  const ssidName     = rawBody.ssidName || rawBody.ssid || '';
+  const radioIdRaw   = rawBody.radioId || rawBody.radio || 1;
+  const siteFromBody = rawBody.site || '';
+  const redirectUrl  = rawBody.redirectUrl || 'http://neverssl.com';
+  const email        = rawBody.email || '';
+  const extend       = !!rawBody.extend;
+
+  // Force Omada site to env name if provided
+  const omadaSite = (OMADA_SITE_NAME && OMADA_SITE_NAME.trim()) || siteFromBody || 'Default';
+
+  // MACs in colon format for Omada
+  const clientMac = macToColons(clientMacRaw);
+  const apMac     = macToColons(apMacRaw);
 
   log('REQUEST BODY (redacted):', {
     clientMac: clientMac ? '(present)' : '',
     apMac:     apMac ? '(present)' : '',
     ssidName:  ssidName || '',
-    radioId:   radioIdRaw || '',
-    site:      site || '',
+    radioId:   Number(radioIdRaw) || 1,
+    site:      omadaSite,
     email:     email ? '(present)' : '',
     extend,
     redirectUrl
@@ -81,14 +89,14 @@ export default async function handler(req, res) {
     log('Redis ping start');
     redis = await getRedis();
     const key = `w2g:auth-ping:${clientMac || 'unknown'}`;
-    await redis.set(key, JSON.stringify({ when: new Date().toISOString(), site: site || '(none)' }), { EX: 300 });
+    await redis.set(key, JSON.stringify({ when: new Date().toISOString(), site: omadaSite }), { EX: 300 });
     log(`Redis key set ${key}`);
   } catch (e) {
     console.error(`[authorize][${rid}] Redis connect error`, e?.message || e);
     return res.status(502).json({ ok: false, error: 'Redis unavailable' });
   }
 
-  if (!clientMac || !site) {
+  if (!clientMac || !omadaSite) {
     err('Missing required fields: clientMac or site.');
     return res.status(400).json({ ok: false, error: 'Missing clientMac or site from splash redirect.' });
   }
@@ -213,8 +221,10 @@ export default async function handler(req, res) {
     return Number.isFinite(n) ? Math.round(n) : d;
   }
 
-  function normalizeMac(mac) {
-    return String(mac || '').trim().toUpperCase().replace(/[^0-9A-F]/g, '-');
+  function macToColons(mac) {
+    const hex = String(mac || '').toUpperCase().replace(/[^0-9A-F]/g, '');
+    if (hex.length !== 12) return String(mac || '').toUpperCase().replace(/[^0-9A-F]/g, ':');
+    return hex.match(/.{1,2}/g).join(':');
   }
 
   /* Flow */
@@ -332,14 +342,17 @@ export default async function handler(req, res) {
   const cookieHeader = cookiePairs.length ? { Cookie: cookiePairs.join('; ') } : {};
   log('Login cookies parsed count=', cookiePairs.length, 'csrf(len)=', String(csrf || '').length);
 
-  // 4 Omada authorize (strict headers)
+  // 4 Omada authorize (site name, mac colons, time in microseconds)
+  const timeMs = Math.max(60000, Number(policyNow.msRemaining) || 60000);
+  const timeUs = timeMs * 1000;
+
   const payload = {
     clientMac,
     apMac,
     ssidName,
-    radioId: radioIdRaw ? Number(radioIdRaw) : 1,
-    site,
-    time: Math.max(60000, Number(policyNow.msRemaining) || 60000), // integer milliseconds
+    radioId: Number(radioIdRaw) || 1,
+    site: omadaSite,        // <-- Site NAME, not GUID
+    time: timeUs,           // <-- microseconds per Omada spec
     authType: 4
   };
 
@@ -369,8 +382,8 @@ export default async function handler(req, res) {
       clientMac,
       apMac,
       ssidName,
-      site,
-      durationMs: payload.time,
+      site: omadaSite,
+      durationMs: timeMs,
       phase: policyNow.phase,
       extend: !!extend,
       debitCents: isBasic ? requiredCents : 0,
@@ -408,6 +421,8 @@ function toInt(v, d) {
   return Number.isFinite(n) ? Math.round(n) : d;
 }
 
-function normalizeMac(mac) {
-  return String(mac || '').trim().toUpperCase().replace(/[^0-9A-F]/g, '-');
+function macToColons(mac) {
+  const hex = String(mac || '').toUpperCase().replace(/[^0-9A-F]/g, '');
+  if (hex.length !== 12) return String(mac || '').toUpperCase().replace(/[^0-9A-F]/g, ':');
+  return hex.match(/.{1,2}/g).join(':');
 }
