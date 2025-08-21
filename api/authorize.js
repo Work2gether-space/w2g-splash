@@ -1,8 +1,10 @@
 // api/authorize.js  Vercel Node runtime, ESM style
-// Build: 2025-08-21e.1  step 3.4 site id fix + nexudus probe
-// Change: send Omada site ID to /extPortal/auth instead of site name
+// Build: 2025-08-21f.1  step 3.4 auth probe + site id + mac variants
+// Adds X-Debug-Probe: nexudus|auth
+// Uses Omada site id for /extPortal/auth
+// Expands auth matrix with plain and plainlower MAC formats and withHost/noHost variants
 
-console.log("DEBUG: authorize.js build version 2025-08-21e.1");
+console.log("DEBUG: authorize.js build version 2025-08-21f.1");
 
 export default async function handler(req, res) {
   const rid = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
@@ -17,23 +19,19 @@ export default async function handler(req, res) {
   const https = await import('https');
 
   const {
-    // Omada
     OMADA_BASE,
     OMADA_CONTROLLER_ID,
     OMADA_OPERATOR_USER,
     OMADA_OPERATOR_PASS,
     OMADA_SITE_NAME,
-    OMADA_SITE_ID, // new
+    OMADA_SITE_ID,
 
-    // Nexudus
     NEXUDUS_BASE,
     NEXUDUS_USER,
     NEXUDUS_PASS,
 
-    // App timezone
     APP_TZ = 'America/New_York',
 
-    // Credit config in cents
     BASIC_MONTHLY_CENTS = '7500',
     BASIC_SESSION_CENTS = '500',
     BASIC_EXTEND_CENTS  = '500'
@@ -56,7 +54,6 @@ export default async function handler(req, res) {
   const NEX_AUTH  = "Basic " + Buffer.from(`${NEXUDUS_USER}:${NEXUDUS_PASS}`).toString("base64");
   const hostHeaderValue = (() => { try { return new URL(base).host; } catch { return 'omada.work2gether.space'; } })();
 
-  // body
   const b = (req.body && typeof req.body === 'object') ? req.body : {};
   const clientMacRaw = b.clientMac || b.client_id || '';
   const apMacRaw     = b.apMac || '';
@@ -67,27 +64,22 @@ export default async function handler(req, res) {
   const email        = b.email || '';
   const extend       = !!b.extend;
 
-  // debug probe switch
   const dbgProbe = String(
     (req.headers['x-debug-probe'] || '') ||
     (req.query && (req.query.debug || '')) ||
     (b.debug || '')
   ).toLowerCase().trim();
 
-  // site handling
   const looksLikeId = (s) => /^[a-f0-9]{24}$/i.test(String(s || '').trim());
-  const siteName = (OMADA_SITE_NAME && OMADA_SITE_NAME.trim()) || siteFromBody || 'Default';
+  const siteName = (OMADA_SITE_NAME && OMADA_SITE_NAME.trim()) || (looksLikeId(siteFromBody) ? '' : siteFromBody) || 'Default';
   const siteId = looksLikeId(siteFromBody) ? siteFromBody
              : looksLikeId(OMADA_SITE_ID) ? OMADA_SITE_ID
              : null;
 
-  if (!clientMacRaw || !siteName) return res.status(400).json({ ok: false, error: 'Missing clientMac or site' });
-  if (!email) return res.status(400).json({ ok: false, error: 'Email is required on the splash form.' });
-
-  if (!siteId) {
-    err('Omada site id is missing. Provide OMADA_SITE_ID env or pass body.site as the 24 char site id.');
-    return res.status(400).json({ ok: false, error: 'Missing Omada site id' });
+  if (!clientMacRaw || (!siteId)) {
+    return res.status(400).json({ ok: false, error: !clientMacRaw ? 'Missing clientMac' : 'Missing Omada site id' });
   }
+  if (!email) return res.status(400).json({ ok: false, error: 'Email is required on the splash form.' });
 
   log('REQUEST BODY (redacted):', {
     clientMac: clientMacRaw ? '(present)' : '',
@@ -126,55 +118,41 @@ export default async function handler(req, res) {
     return res.status(502).json({ ok: false, error: 'Redis unavailable' });
   }
 
-  // Nexudus clients and helpers
-  const nx = axios.create({
-    baseURL: NEXUDUS_BASE.replace(/\/+$/, ''),
-    timeout: 15000,
-    headers: { Accept: 'application/json', Authorization: NEX_AUTH }
-  });
+  // Nexudus http
+  const axiosBase = axios.create({ baseURL: NEXUDUS_BASE.replace(/\/+$/, ''), timeout: 15000, headers: { Accept: 'application/json', Authorization: NEX_AUTH } });
 
   async function nxGetCoworkerByEmail(email) {
     const url = `/api/spaces/coworkers?Coworker_email=${encodeURIComponent(email)}&_take=1`;
-    const r = await nx.get(url, { validateStatus: () => true });
+    const r = await axiosBase.get(url, { validateStatus: () => true });
     log('Nexudus coworkers GET status', r.status, 'url', url);
-    if (r.status !== 200) {
-      const brief = safeBrief(r.data);
-      throw new Error(`Nexudus coworkers HTTP ${r.status} body=${brief}`);
-    }
+    if (r.status !== 200) throw new Error(`Nexudus coworkers HTTP ${r.status}`);
     return r.data?.Records?.[0] || null;
   }
-
   async function nxGetActiveContracts(coworkerId) {
     const url = `/api/billing/coworkercontracts?coworkercontract_coworker=${encodeURIComponent(coworkerId)}&coworkercontract_active=true`;
-    const r = await nx.get(url, { validateStatus: () => true });
+    const r = await axiosBase.get(url, { validateStatus: () => true });
     log('Nexudus contracts GET status', r.status, 'url', url);
-    if (r.status !== 200) {
-      const brief = safeBrief(r.data);
-      throw new Error(`Nexudus contracts HTTP ${r.status} body=${brief}`);
-    }
+    if (r.status !== 200) throw new Error(`Nexudus contracts HTTP ${r.status}`);
     return Array.isArray(r.data?.Records) ? r.data.Records : [];
   }
 
-  // Utils
+  // utils
   function toInt(v, d) { const n = Number(v); return Number.isFinite(n) ? Math.round(n) : d; }
+  const macHex = mac => String(mac || '').toUpperCase().replace(/[^0-9A-F]/g, '');
   const macToColons  = mac => {
-    const hex = String(mac || '').toUpperCase().replace(/[^0-9A-F]/g, '');
+    const hex = macHex(mac);
     if (hex.length !== 12) return String(mac || '').toUpperCase().replace(/[^0-9A-F]/g, ':');
     return hex.match(/.{1,2}/g).join(':');
   };
   const macToHyphens = mac => {
-    const hex = String(mac || '').toUpperCase().replace(/[^0-9A-F]/g, '');
+    const hex = macHex(mac);
     if (hex.length !== 12) return String(mac || '').toUpperCase().replace(/[^0-9A-F]/g, '-');
     return hex.match(/.{1,2}/g).join('-');
   };
-  function safeBrief(body) {
-    try {
-      const s = typeof body === 'string' ? body : JSON.stringify(body);
-      return s.length > 300 ? s.slice(0, 300) + '…' : s;
-    } catch { return '(unserializable)'; }
-  }
+  const macPlain = mac => macHex(mac);
+  const macPlainLower = mac => macPlain(mac).toLowerCase();
 
-  // Ledger helpers
+  // ledger helpers
   const MONTHLY_CENTS = toInt(BASIC_MONTHLY_CENTS, 7500);
   const SESSION_CENTS = toInt(BASIC_SESSION_CENTS, 500);
   const EXTEND_CENTS  = toInt(BASIC_EXTEND_CENTS, 500);
@@ -193,7 +171,6 @@ export default async function handler(req, res) {
     await redis.set(ledgerKey, JSON.stringify(seed));
     return seed;
   }
-
   function centsForCharge(code) {
     if (code === 'daily') return SESSION_CENTS;
     if (code === 'after_hours') return EXTEND_CENTS;
@@ -201,7 +178,7 @@ export default async function handler(req, res) {
     return 0;
   }
 
-  // 0 Nexudus precheck
+  // Nexudus precheck
   let coworker, hasBasic = false, hasClassic = false, has247 = false;
   try {
     coworker = await nxGetCoworkerByEmail(email);
@@ -222,7 +199,7 @@ export default async function handler(req, res) {
     return res.status(502).json({ ok: false, error: 'Nexudus precheck failed', detail: String(e?.message || e) });
   }
 
-  // 1 Time window plan
+  // time window plan
   const isBasic = hasBasic;
   let plan;
   try {
@@ -239,7 +216,7 @@ export default async function handler(req, res) {
   }
   const totalRequiredCents = plan.charges.reduce((sum, ch) => sum + centsForCharge(ch.code), 0);
 
-  // 1a probe short circuit
+  // probe: nexudus
   if (dbgProbe === 'nexudus') {
     log('Probe mode nexudus short circuit before Omada calls');
     return res.status(200).json({
@@ -257,7 +234,7 @@ export default async function handler(req, res) {
     });
   }
 
-  // 2 Ensure credits
+  // credits
   let ledgerKey, eventsKey, ledger;
   try {
     const cycleKey = localCycleKey(new Date(), APP_TZ);
@@ -282,9 +259,8 @@ export default async function handler(req, res) {
     return res.status(502).json({ ok: false, error: 'Credit ledger unavailable' });
   }
 
-  // 3 Omada login with portal warm up
+  // omada http helpers
   async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
   function makeClient(variant, purpose) {
     const agent = new https.Agent({ rejectUnauthorized: false, keepAlive: false, maxSockets: 1 });
     const uaBase = purpose === 'warmup' ? 'w2g-splash-warmup' : 'w2g-splash-login';
@@ -308,7 +284,6 @@ export default async function handler(req, res) {
     const httpWarm = makeClient(variant, 'warmup');
     log(`LOGIN attempt ${attempt} ${variant} WARMUP:`, PORTAL_URL);
     const warm = await httpWarm.get(PORTAL_URL);
-    const warmIsHtml = typeof warm.data === 'string' && /<html/i.test(warm.data);
     const warmCookies = warm.headers?.['set-cookie'] || [];
 
     const httpLogin = makeClient(variant, 'login');
@@ -358,16 +333,13 @@ export default async function handler(req, res) {
   const csrf = loginHeaders?.['csrf-token'] || loginHeaders?.['Csrf-Token'] || loginData?.result?.token || null;
   if (!csrf) return res.status(502).json({ ok: false, error: 'Login returned no CSRF token' });
 
-  // 4 Omada authorize using duration from plan
-  const timeMsBase = Math.max(60000, Number(plan.durationMs || 0) || 60000);
-  const strictHeaders = {
+  const baseAuthHeaders = {
     Cookie: loginCookies.map(c => String(c).split(';')[0]).join('; '),
     'Csrf-Token': csrf,
     'X-Csrf-Token': csrf,
     'X-Requested-With': 'XMLHttpRequest',
     'Origin': base,
     'Referer': PORTAL_URL,
-    Host: hostHeaderValue,
     Accept: 'application/json'
   };
   const httpsAgentAuth = new https.Agent({ rejectUnauthorized: false, keepAlive: false, maxSockets: 1 });
@@ -379,21 +351,53 @@ export default async function handler(req, res) {
     return { data: resp.data, status: resp.status, cookies, headers: resp.headers };
   };
 
-  const timeUnits = [
-    { label: 'ms', value: timeMsBase },
-    { label: 'us', value: timeMsBase * 1000 },
-    { label: 's',  value: Math.floor(timeMsBase / 1000) }
-  ];
+  const timeMsBase = Math.max(60000, Number(plan.durationMs || 0) || 60000);
+
   const macFormats = [
-    { label: 'colons',  cm: macToColons(clientMacRaw), am: macToColons(apMacRaw) },
-    { label: 'hyphens', cm: macToHyphens(clientMacRaw), am: macToHyphens(apMacRaw) }
+    { label: 'colons',     cm: macToColons(clientMacRaw), am: macToColons(apMacRaw) },
+    { label: 'hyphens',    cm: macToHyphens(clientMacRaw), am: macToHyphens(apMacRaw) },
+    { label: 'plain',      cm: macPlain(clientMacRaw), am: macPlain(apMacRaw) },
+    { label: 'plainlower', cm: macPlainLower(clientMacRaw), am: macPlainLower(apMacRaw) }
   ];
   const authTypes = [4, 2];
+  const headerVariants = [
+    { label: 'withHost', extra: { Host: hostHeaderValue } },
+    { label: 'noHost',   extra: {} }
+  ];
 
+  // probe: auth
+  if (dbgProbe === 'auth') {
+    const attempts = [];
+    for (const hv of headerVariants) {
+      for (const mf of macFormats) {
+        for (const at of authTypes) {
+          const payload = {
+            clientMac: mf.cm,
+            apMac: mf.am,
+            ssidName,
+            ssid: ssidName,
+            radioId: Number(radioIdRaw) || 1,
+            site: siteId,
+            time: timeMsBase,
+            authType: at
+          };
+          const headers = { ...baseAuthHeaders, ...hv.extra };
+          const { data: authData, status: authStatus } = await postJson(AUTH_URL, payload, headers);
+          attempts.push({ hv: hv.label, mac: mf.label, authType: at, status: authStatus, errorCode: authData?.errorCode, body: truncate(authData) });
+          if (authStatus === 200 && authData?.errorCode === 0) {
+            return res.status(200).json({ ok: true, probe: 'auth', success: { hv: hv.label, mac: mf.label, authType: at }, attempts });
+          }
+        }
+      }
+    }
+    return res.status(502).json({ ok: false, probe: 'auth', attempts });
+  }
+
+  // normal authorize matrix
   let authOk = false, last = { status: 0, data: null, note: '' };
   outer:
-  for (const mf of macFormats) {
-    for (const tu of timeUnits) {
+  for (const hv of headerVariants) {
+    for (const mf of macFormats) {
       for (const at of authTypes) {
         const payload = {
           clientMac: mf.cm,
@@ -401,13 +405,14 @@ export default async function handler(req, res) {
           ssidName,
           ssid: ssidName,
           radioId: Number(radioIdRaw) || 1,
-          site: siteId,               // send ID not name
-          time: tu.value,
+          site: siteId,
+          time: timeMsBase,
           authType: at
         };
-        log(`AUTHORIZE TRY mac=${mf.label} time=${tu.label} authType=${at} site=${siteId} -> ${AUTH_URL} payload:`, { ...payload, clientMac: '(present)', apMac: '(present)' });
-        const { data: authData, status: authStatus } = await postJson(AUTH_URL, payload, strictHeaders);
-        last = { status: authStatus, data: authData, note: `mac=${mf.label} time=${tu.label} authType=${at}` };
+        const headers = { ...baseAuthHeaders, ...hv.extra };
+        log(`AUTHORIZE TRY head=${hv.label} mac=${mf.label} authType=${at} -> ${AUTH_URL} payload:`, { ...payload, clientMac: '(present)', apMac: '(present)' });
+        const { data: authData, status: authStatus } = await postJson(AUTH_URL, payload, headers);
+        last = { status: authStatus, data: authData, note: `head=${hv.label} mac=${mf.label} authType=${at}` };
         if (authStatus === 200 && authData?.errorCode === 0) { authOk = true; break outer; }
         if (!(authStatus === 200 && authData?.errorCode === -41501)) break;
       }
@@ -419,7 +424,7 @@ export default async function handler(req, res) {
     return res.status(502).json({ ok: false, error: 'Authorization failed', detail: last.data, attempt: last.note });
   }
 
-  // 5 Ledger debit and event
+  // ledger debit and event
   try {
     const cycleKey = localCycleKey(new Date(), APP_TZ);
     const { ledgerKey, eventsKey } = creditKeys(cycleKey, coworker.Id);
@@ -454,7 +459,6 @@ export default async function handler(req, res) {
     err('Ledger write error:', e?.message || e);
   }
 
-  // 6 Success
   log('AUTH success -> redirect', redirectUrl);
   return res.status(200).json({
     ok: true,
@@ -464,6 +468,13 @@ export default async function handler(req, res) {
     window: plan.window,
     message: plan.reason
   });
+}
+
+function truncate(obj) {
+  try {
+    const s = typeof obj === 'string' ? obj : JSON.stringify(obj);
+    return s.length > 400 ? s.slice(0, 400) + '…' : s;
+  } catch { return '(unserializable)'; }
 }
 
 /* utils */
@@ -477,4 +488,10 @@ function macToHyphens(mac) {
   const hex = String(mac || '').toUpperCase().replace(/[^0-9A-F]/g, '');
   if (hex.length !== 12) return String(mac || '').toUpperCase().replace(/[^0-9A-F]/g, '-');
   return hex.match(/.{1,2}/g).join('-');
+}
+function macPlain(mac) {
+  return String(mac || '').toUpperCase().replace(/[^0-9A-F]/g, '');
+}
+function macPlainLower(mac) {
+  return macPlain(mac).toLowerCase();
 }
