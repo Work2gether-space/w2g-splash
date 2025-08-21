@@ -1,7 +1,7 @@
 // api/authorize.js  Vercel Node runtime, ESM style
-// Build: 2025-08-20k.5a  (per-attempt Omada login client, Basic time windows wired)
+// Build: 2025-08-20k.5b  (Omada login hardened: per-attempt dual variant with/without Host; Basic time windows wired)
 
-console.log("DEBUG: authorize.js build version 2025-08-20k.5a");
+console.log("DEBUG: authorize.js build version 2025-08-20k.5b");
 
 export default async function handler(req, res) {
   const rid = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
@@ -50,7 +50,7 @@ export default async function handler(req, res) {
   const LOGIN_URL = `${base}/${OMADA_CONTROLLER_ID}/api/v2/hotspot/login`;
   const AUTH_URL  = `${base}/${OMADA_CONTROLLER_ID}/api/v2/hotspot/extPortal/auth`;
   const NEX_AUTH  = "Basic " + Buffer.from(`${NEXUDUS_USER}:${NEXUDUS_PASS}`).toString("base64");
-  const hostHeader = (() => { try { return new URL(base).host; } catch { return 'omada.work2gether.space'; } })();
+  const hostHeaderValue = (() => { try { return new URL(base).host; } catch { return 'omada.work2gether.space'; } })();
 
   // body
   const b = (req.body && typeof req.body === 'object') ? req.body : {};
@@ -112,16 +112,7 @@ export default async function handler(req, res) {
   if (!clientMacRaw || !omadaSite) return res.status(400).json({ ok: false, error: 'Missing clientMac or site' });
   if (!email) return res.status(400).json({ ok: false, error: 'Email is required on the splash form.' });
 
-  // axios clients
-  const sharedHttp = axios.create({
-    timeout: 15000,
-    httpsAgent: new (https.Agent)({ rejectUnauthorized: false }),
-    headers: {
-      Accept: 'application/json',
-      'User-Agent': 'w2g-splash/1.0',
-      Host: hostHeader
-    }
-  });
+  // axios client for Nexudus
   const nx = axios.create({
     baseURL: NEXUDUS_BASE.replace(/\/+$/, ''),
     timeout: 15000,
@@ -142,17 +133,20 @@ export default async function handler(req, res) {
     return Array.isArray(r.data?.Records) ? r.data.Records : [];
   }
 
-  /* HTTP helper for authorize attempts */
-  const postJson = async (url, json, headers = {}) => {
-    const resp = await sharedHttp.post(url, json, {
-      headers: { 'Content-Type': 'application/json', ...headers },
-      validateStatus: () => true
-    });
-    const cookies = resp.headers?.['set-cookie'] || [];
-    return { data: resp.data, status: resp.status, cookies, headers: resp.headers };
+  /* Shared helpers */
+  function toInt(v, d) { const n = Number(v); return Number.isFinite(n) ? Math.round(n) : d; }
+  const macToColons  = mac => {
+    const hex = String(mac || '').toUpperCase().replace(/[^0-9A-F]/g, '');
+    if (hex.length !== 12) return String(mac || '').toUpperCase().replace(/[^0-9A-F]/g, ':');
+    return hex.match(/.{1,2}/g).join(':');
+  };
+  const macToHyphens = mac => {
+    const hex = String(mac || '').toUpperCase().replace(/[^0-9A-F]/g, '');
+    if (hex.length !== 12) return String(mac || '').toUpperCase().replace(/[^0-9A-F]/g, '-');
+    return hex.match(/.{1,2}/g).join('-');
   };
 
-  /* Ledger helpers */
+  // Ledger helpers
   const MONTHLY_CENTS = toInt(BASIC_MONTHLY_CENTS, 7500);
   const SESSION_CENTS = toInt(BASIC_SESSION_CENTS, 500);
   const EXTEND_CENTS  = toInt(BASIC_EXTEND_CENTS, 500);
@@ -174,17 +168,6 @@ export default async function handler(req, res) {
     await redis.set(ledgerKey, JSON.stringify(seed));
     return seed;
   }
-  function toInt(v, d) { const n = Number(v); return Number.isFinite(n) ? Math.round(n) : d; }
-  const macToColons  = mac => {
-    const hex = String(mac || '').toUpperCase().replace(/[^0-9A-F]/g, '');
-    if (hex.length !== 12) return String(mac || '').toUpperCase().replace(/[^0-9A-F]/g, ':');
-    return hex.match(/.{1,2}/g).join(':');
-  };
-  const macToHyphens = mac => {
-    const hex = String(mac || '').toUpperCase().replace(/[^0-9A-F]/g, '');
-    if (hex.length !== 12) return String(mac || '').toUpperCase().replace(/[^0-9A-F]/g, '-');
-    return hex.match(/.{1,2}/g).join('-');
-  };
 
   // Map charge codes from planner to cents in your ledger
   function centsForCharge(code) {
@@ -196,7 +179,7 @@ export default async function handler(req, res) {
 
   /* Flow */
 
-  // 0) Nexudus precheck for membership
+  // 0) Nexudus precheck
   let coworker, hasBasic = false, hasClassic = false, has247 = false;
   try {
     coworker = await nxGetCoworkerByEmail(email);
@@ -218,7 +201,7 @@ export default async function handler(req, res) {
     return res.status(502).json({ ok: false, error: 'Nexudus precheck failed' });
   }
 
-  // 1) Build the time-window plan and compute debit requirement
+  // 1) Build the time-window plan
   const isBasic = hasBasic;
   let plan;
   try {
@@ -235,10 +218,10 @@ export default async function handler(req, res) {
     return res.status(500).json({ ok: false, error: 'Time planner failed' });
   }
 
-  // Sum required cents for this authorization
+  // Required cents
   const totalRequiredCents = plan.charges.reduce((sum, ch) => sum + centsForCharge(ch.code), 0);
 
-  // 2) Ensure credits exist and are sufficient for this authorization
+  // 2) Ensure credits
   let ledgerKey, eventsKey, ledger;
   try {
     const cycleKey = localCycleKey(new Date(), APP_TZ);
@@ -273,21 +256,24 @@ export default async function handler(req, res) {
     return res.status(502).json({ ok: false, error: 'Credit ledger unavailable' });
   }
 
-  // 3) Omada login with per-attempt client to avoid poisoned sockets
+  // 3) Omada login with per-attempt dual variant (with and without Host)
   async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-  function makeLoginHttp(attempt) {
+  function makeLoginHttp(attempt, variant /* 'withHost' | 'noHost' */) {
     const agent = new https.Agent({ rejectUnauthorized: false, keepAlive: false, maxSockets: 1 });
-    const ua = `w2g-splash-login/${attempt}-${Math.random().toString(36).slice(2,6)}`;
+    const ua = `w2g-splash-login/${attempt}-${variant}-${Math.random().toString(36).slice(2,6)}`;
+    const headers = {
+      Accept: 'application/json',
+      'User-Agent': ua,
+      Connection: 'close',
+      'Cache-Control': 'no-cache',
+      Pragma: 'no-cache'
+    };
+    if (variant === 'withHost') headers['Host'] = hostHeaderValue;
     return axios.create({
       timeout: 12000,
       httpsAgent: agent,
-      headers: {
-        Accept: 'application/json',
-        'User-Agent': ua,
-        Host: hostHeader,
-        Connection: 'close'
-      },
+      headers,
       validateStatus: () => true
     });
   }
@@ -295,23 +281,33 @@ export default async function handler(req, res) {
   async function loginWithRetry(max = 8) {
     const backoffs = [300, 600, 1000, 1500, 2500, 3500, 5000, 7000];
     for (let i = 1; i <= max; i++) {
-      const httpLocal = makeLoginHttp(i);
-      log(`LOGIN attempt ${i}/${max}:`, LOGIN_URL);
-      const resp = await httpLocal.post(
-        LOGIN_URL,
-        { name: OMADA_OPERATOR_USER, password: OMADA_OPERATOR_PASS },
-        { headers: { 'Content-Type': 'application/json' } }
-      );
-
-      const isHtml = typeof resp.data === 'string' && /<html/i.test(resp.data);
-      const ok = resp.status === 200 && !isHtml && resp.data?.errorCode === 0;
-      if (ok) return { data: resp.data, status: resp.status, headers: resp.headers, cookies: resp.headers?.['set-cookie'] || [] };
-
-      const retryableStatus = (resp.status >= 500 && resp.status <= 599) || resp.status === 530;
-      const retryable = isHtml || retryableStatus;
-      if (!retryable || i === max) {
-        err('LOGIN failed', resp.status, 'detail:', isHtml ? '(html)' : JSON.stringify(resp.data || {}));
-        return null;
+      // Variant A: with Host header
+      {
+        const httpA = makeLoginHttp(i, 'withHost');
+        log(`LOGIN attempt ${i}/${max} A(withHost):`, LOGIN_URL);
+        const rA = await httpA.post(LOGIN_URL, { name: OMADA_OPERATOR_USER, password: OMADA_OPERATOR_PASS }, { headers: { 'Content-Type': 'application/json' } });
+        const isHtmlA = typeof rA.data === 'string' && /<html/i.test(rA.data);
+        const okA = rA.status === 200 && !isHtmlA && rA.data?.errorCode === 0;
+        if (okA) return { data: rA.data, status: rA.status, headers: rA.headers, cookies: rA.headers?.['set-cookie'] || [] };
+        const retryableA = isHtmlA || (rA.status >= 500 || rA.status === 530);
+        if (!retryableA) {
+          err('LOGIN failed A(non-retryable)', rA.status, 'detail:', isHtmlA ? '(html)' : JSON.stringify(rA.data || {}));
+          return null;
+        }
+      }
+      // Variant B: without Host header
+      {
+        const httpB = makeLoginHttp(i, 'noHost');
+        log(`LOGIN attempt ${i}/${max} B(noHost):`, LOGIN_URL);
+        const rB = await httpB.post(LOGIN_URL, { name: OMADA_OPERATOR_USER, password: OMADA_OPERATOR_PASS }, { headers: { 'Content-Type': 'application/json' } });
+        const isHtmlB = typeof rB.data === 'string' && /<html/i.test(rB.data);
+        const okB = rB.status === 200 && !isHtmlB && rB.data?.errorCode === 0;
+        if (okB) return { data: rB.data, status: rB.status, headers: rB.headers, cookies: rB.headers?.['set-cookie'] || [] };
+        const retryableB = isHtmlB || (rB.status >= 500 || rB.status === 530);
+        if (!retryableB) {
+          err('LOGIN failed B(non-retryable)', rB.status, 'detail:', isHtmlB ? '(html)' : JSON.stringify(rB.data || {}));
+          return null;
+        }
       }
       const jitter = Math.floor(Math.random() * 150);
       await sleep((backoffs[i - 1] || 1000) + jitter);
@@ -328,12 +324,12 @@ export default async function handler(req, res) {
   const csrf = loginHeaders?.['csrf-token'] || loginHeaders?.['Csrf-Token'] || loginData?.result?.token || null;
   if (!csrf) return res.status(502).json({ ok: false, error: 'Login returned no CSRF token' });
 
-  // Cookies header
+  // Cookies header for subsequent authorize call
   const cookiePairs = Array.isArray(loginCookies) ? loginCookies.map(c => String(c).split(';')[0]).filter(Boolean) : [];
   const cookieHeader = cookiePairs.length ? { Cookie: cookiePairs.join('; ') } : {};
   log('Login cookies parsed count=', cookiePairs.length, 'csrf(len)=', String(csrf || '').length);
 
-  // 4) Omada authorize with duration from plan
+  // 4) Omada authorize using duration from plan
   const timeMsBase = Math.max(60000, Number(plan.durationMs || 0) || 60000);
   const timeUnits = [
     { label: 'ms', value: timeMsBase },
@@ -353,8 +349,22 @@ export default async function handler(req, res) {
     'X-Requested-With': 'XMLHttpRequest',
     'Origin': base,
     'Referer': `${base}/${OMADA_CONTROLLER_ID}/portal`,
-    Host: hostHeader,
+    Host: hostHeaderValue,
     Accept: 'application/json'
+  };
+
+  // Minimal HTTP client for authorize
+  const httpsAgentAuth = new https.Agent({ rejectUnauthorized: false, keepAlive: false, maxSockets: 1 });
+  const httpAuth = axios.create({
+    timeout: 15000,
+    httpsAgent: httpsAgentAuth,
+    headers: { Accept: 'application/json' },
+    validateStatus: () => true
+  });
+  const postJson = async (url, json, headers = {}) => {
+    const resp = await httpAuth.post(url, json, { headers: { 'Content-Type': 'application/json', ...headers } });
+    const cookies = resp.headers?.['set-cookie'] || [];
+    return { data: resp.data, status: resp.status, cookies, headers: resp.headers };
   };
 
   let authOk = false, last = { status: 0, data: null, note: '' };
@@ -386,7 +396,7 @@ export default async function handler(req, res) {
     return res.status(502).json({ ok: false, error: 'Authorization failed', detail: last.data, attempt: last.note });
   }
 
-  // 5) Record debit and event
+  // 5) Record debit & event
   try {
     const debitCents = isBasic ? totalRequiredCents : 0;
 
