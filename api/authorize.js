@@ -1,9 +1,8 @@
 // api/authorize.js  Vercel Node runtime, ESM style
-// Build: 2025-08-21d.3  step 3.4 probe ready
-// Adds Nexudus probe mode to isolate coworker lookups and plans without calling Omada
-// Adds richer Nexudus error messages and logs while keeping existing flow intact
+// Build: 2025-08-21e.1  step 3.4 site id fix + nexudus probe
+// Change: send Omada site ID to /extPortal/auth instead of site name
 
-console.log("DEBUG: authorize.js build version 2025-08-21d.3");
+console.log("DEBUG: authorize.js build version 2025-08-21e.1");
 
 export default async function handler(req, res) {
   const rid = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
@@ -24,6 +23,7 @@ export default async function handler(req, res) {
     OMADA_OPERATOR_USER,
     OMADA_OPERATOR_PASS,
     OMADA_SITE_NAME,
+    OMADA_SITE_ID, // new
 
     // Nexudus
     NEXUDUS_BASE,
@@ -74,14 +74,28 @@ export default async function handler(req, res) {
     (b.debug || '')
   ).toLowerCase().trim();
 
-  const omadaSite = (OMADA_SITE_NAME && OMADA_SITE_NAME.trim()) || siteFromBody || 'Default';
+  // site handling
+  const looksLikeId = (s) => /^[a-f0-9]{24}$/i.test(String(s || '').trim());
+  const siteName = (OMADA_SITE_NAME && OMADA_SITE_NAME.trim()) || siteFromBody || 'Default';
+  const siteId = looksLikeId(siteFromBody) ? siteFromBody
+             : looksLikeId(OMADA_SITE_ID) ? OMADA_SITE_ID
+             : null;
+
+  if (!clientMacRaw || !siteName) return res.status(400).json({ ok: false, error: 'Missing clientMac or site' });
+  if (!email) return res.status(400).json({ ok: false, error: 'Email is required on the splash form.' });
+
+  if (!siteId) {
+    err('Omada site id is missing. Provide OMADA_SITE_ID env or pass body.site as the 24 char site id.');
+    return res.status(400).json({ ok: false, error: 'Missing Omada site id' });
+  }
 
   log('REQUEST BODY (redacted):', {
     clientMac: clientMacRaw ? '(present)' : '',
     apMac:     apMacRaw ? '(present)' : '',
     ssidName:  ssidName || '',
     radioId:   Number(radioIdRaw) || 1,
-    site:      omadaSite,
+    siteName,
+    siteId,
     email:     email ? '(present)' : '',
     extend,
     redirectUrl,
@@ -106,14 +120,11 @@ export default async function handler(req, res) {
     const { getRedis } = await import('../lib/redis.js');
     log('Redis ping start');
     redis = await getRedis();
-    await redis.set(`w2g:auth-ping:${clientMacRaw || 'unknown'}`, JSON.stringify({ when: new Date().toISOString(), site: omadaSite }), { EX: 300 });
+    await redis.set(`w2g:auth-ping:${clientMacRaw || 'unknown'}`, JSON.stringify({ when: new Date().toISOString(), site: siteName, siteId }), { EX: 300 });
   } catch (e) {
     console.error(`[authorize][${rid}] Redis connect error`, e?.message || e);
     return res.status(502).json({ ok: false, error: 'Redis unavailable' });
   }
-
-  if (!clientMacRaw || !omadaSite) return res.status(400).json({ ok: false, error: 'Missing clientMac or site' });
-  if (!email) return res.status(400).json({ ok: false, error: 'Email is required on the splash form.' });
 
   // Nexudus clients and helpers
   const nx = axios.create({
@@ -240,7 +251,9 @@ export default async function handler(req, res) {
       window: plan.window,
       durationMs: plan.durationMs,
       charges: plan.charges,
-      requiredCents: totalRequiredCents
+      requiredCents: totalRequiredCents,
+      siteId,
+      siteName
     });
   }
 
@@ -388,11 +401,11 @@ export default async function handler(req, res) {
           ssidName,
           ssid: ssidName,
           radioId: Number(radioIdRaw) || 1,
-          site: omadaSite,
+          site: siteId,               // send ID not name
           time: tu.value,
           authType: at
         };
-        log(`AUTHORIZE TRY mac=${mf.label} time=${tu.label} authType=${at} -> ${AUTH_URL} payload:`, { ...payload, clientMac: '(present)', apMac: '(present)' });
+        log(`AUTHORIZE TRY mac=${mf.label} time=${tu.label} authType=${at} site=${siteId} -> ${AUTH_URL} payload:`, { ...payload, clientMac: '(present)', apMac: '(present)' });
         const { data: authData, status: authStatus } = await postJson(AUTH_URL, payload, strictHeaders);
         last = { status: authStatus, data: authData, note: `mac=${mf.label} time=${tu.label} authType=${at}` };
         if (authStatus === 200 && authData?.errorCode === 0) { authOk = true; break outer; }
@@ -427,7 +440,8 @@ export default async function handler(req, res) {
       clientMac: macToColons(clientMacRaw),
       apMac: macToColons(apMacRaw),
       ssidName,
-      site: omadaSite,
+      site: siteName,
+      siteId,
       durationMs: timeMsBase,
       window: plan.window,
       extend: !!extend,
