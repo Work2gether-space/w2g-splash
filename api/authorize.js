@@ -1,11 +1,9 @@
 // api/authorize.js  Vercel Node runtime, ESM style
-// Build: 2025-08-20k.5c
-// Changes:
-// - Adds per-attempt "portal warm-up" GET (with & without Host) before login POST
-// - Keeps dual-variant login (withHost / noHost), fresh HTTPS agent each try
-// - Preserves Basic time windows + ledger debits and authorize matrix
+// Build: 2025-08-21d.3  step 3.4 probe ready
+// Adds Nexudus probe mode to isolate coworker lookups and plans without calling Omada
+// Adds richer Nexudus error messages and logs while keeping existing flow intact
 
-console.log("DEBUG: authorize.js build version 2025-08-20k.5c");
+console.log("DEBUG: authorize.js build version 2025-08-21d.3");
 
 export default async function handler(req, res) {
   const rid = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
@@ -69,6 +67,13 @@ export default async function handler(req, res) {
   const email        = b.email || '';
   const extend       = !!b.extend;
 
+  // debug probe switch
+  const dbgProbe = String(
+    (req.headers['x-debug-probe'] || '') ||
+    (req.query && (req.query.debug || '')) ||
+    (b.debug || '')
+  ).toLowerCase().trim();
+
   const omadaSite = (OMADA_SITE_NAME && OMADA_SITE_NAME.trim()) || siteFromBody || 'Default';
 
   log('REQUEST BODY (redacted):', {
@@ -79,10 +84,11 @@ export default async function handler(req, res) {
     site:      omadaSite,
     email:     email ? '(present)' : '',
     extend,
-    redirectUrl
+    redirectUrl,
+    dbgProbe
   });
 
-  // Load time windows (CommonJS module)
+  // Load time windows
   let planBasicSession;
   try {
     const tw = await import('../lib/timeWindows.js');
@@ -109,22 +115,32 @@ export default async function handler(req, res) {
   if (!clientMacRaw || !omadaSite) return res.status(400).json({ ok: false, error: 'Missing clientMac or site' });
   if (!email) return res.status(400).json({ ok: false, error: 'Email is required on the splash form.' });
 
-  // Nexudus clients/helpers
+  // Nexudus clients and helpers
   const nx = axios.create({
     baseURL: NEXUDUS_BASE.replace(/\/+$/, ''),
     timeout: 15000,
     headers: { Accept: 'application/json', Authorization: NEX_AUTH }
   });
+
   async function nxGetCoworkerByEmail(email) {
     const url = `/api/spaces/coworkers?Coworker_email=${encodeURIComponent(email)}&_take=1`;
     const r = await nx.get(url, { validateStatus: () => true });
-    if (r.status !== 200) throw new Error(`Nexudus coworkers HTTP ${r.status}`);
+    log('Nexudus coworkers GET status', r.status, 'url', url);
+    if (r.status !== 200) {
+      const brief = safeBrief(r.data);
+      throw new Error(`Nexudus coworkers HTTP ${r.status} body=${brief}`);
+    }
     return r.data?.Records?.[0] || null;
   }
+
   async function nxGetActiveContracts(coworkerId) {
     const url = `/api/billing/coworkercontracts?coworkercontract_coworker=${encodeURIComponent(coworkerId)}&coworkercontract_active=true`;
     const r = await nx.get(url, { validateStatus: () => true });
-    if (r.status !== 200) throw new Error(`Nexudus contracts HTTP ${r.status}`);
+    log('Nexudus contracts GET status', r.status, 'url', url);
+    if (r.status !== 200) {
+      const brief = safeBrief(r.data);
+      throw new Error(`Nexudus contracts HTTP ${r.status} body=${brief}`);
+    }
     return Array.isArray(r.data?.Records) ? r.data.Records : [];
   }
 
@@ -140,6 +156,12 @@ export default async function handler(req, res) {
     if (hex.length !== 12) return String(mac || '').toUpperCase().replace(/[^0-9A-F]/g, '-');
     return hex.match(/.{1,2}/g).join('-');
   };
+  function safeBrief(body) {
+    try {
+      const s = typeof body === 'string' ? body : JSON.stringify(body);
+      return s.length > 300 ? s.slice(0, 300) + '…' : s;
+    } catch { return '(unserializable)'; }
+  }
 
   // Ledger helpers
   const MONTHLY_CENTS = toInt(BASIC_MONTHLY_CENTS, 7500);
@@ -168,7 +190,7 @@ export default async function handler(req, res) {
     return 0;
   }
 
-  // 0) Nexudus precheck
+  // 0 Nexudus precheck
   let coworker, hasBasic = false, hasClassic = false, has247 = false;
   try {
     coworker = await nxGetCoworkerByEmail(email);
@@ -186,10 +208,10 @@ export default async function handler(req, res) {
     }
   } catch (e) {
     err('Nexudus precheck error:', e?.message || e);
-    return res.status(502).json({ ok: false, error: 'Nexudus precheck failed' });
+    return res.status(502).json({ ok: false, error: 'Nexudus precheck failed', detail: String(e?.message || e) });
   }
 
-  // 1) Time-window plan & required cents
+  // 1 Time window plan
   const isBasic = hasBasic;
   let plan;
   try {
@@ -206,7 +228,23 @@ export default async function handler(req, res) {
   }
   const totalRequiredCents = plan.charges.reduce((sum, ch) => sum + centsForCharge(ch.code), 0);
 
-  // 2) Ensure credits
+  // 1a probe short circuit
+  if (dbgProbe === 'nexudus') {
+    log('Probe mode nexudus short circuit before Omada calls');
+    return res.status(200).json({
+      ok: true,
+      probe: 'nexudus',
+      coworkerId: coworker.Id,
+      fullName: coworker.FullName,
+      plans: { basic: hasBasic, classic: hasClassic, p247: has247 },
+      window: plan.window,
+      durationMs: plan.durationMs,
+      charges: plan.charges,
+      requiredCents: totalRequiredCents
+    });
+  }
+
+  // 2 Ensure credits
   let ledgerKey, eventsKey, ledger;
   try {
     const cycleKey = localCycleKey(new Date(), APP_TZ);
@@ -231,10 +269,10 @@ export default async function handler(req, res) {
     return res.status(502).json({ ok: false, error: 'Credit ledger unavailable' });
   }
 
-  // 3) Omada login with portal warm-up
+  // 3 Omada login with portal warm up
   async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-  function makeClient(variant /* 'withHost' | 'noHost' */, purpose /* 'warmup' | 'login' */) {
+  function makeClient(variant, purpose) {
     const agent = new https.Agent({ rejectUnauthorized: false, keepAlive: false, maxSockets: 1 });
     const uaBase = purpose === 'warmup' ? 'w2g-splash-warmup' : 'w2g-splash-login';
     const headers = {
@@ -254,15 +292,12 @@ export default async function handler(req, res) {
   }
 
   async function tryVariantOnce(attempt, variant) {
-    // Warm-up GET to /portal
     const httpWarm = makeClient(variant, 'warmup');
     log(`LOGIN attempt ${attempt} ${variant} WARMUP:`, PORTAL_URL);
     const warm = await httpWarm.get(PORTAL_URL);
     const warmIsHtml = typeof warm.data === 'string' && /<html/i.test(warm.data);
-    const warmRetryable = warmIsHtml || warm.status >= 300; // 3xx/4xx/5xx: we still proceed to login, cookies/routes may be set
     const warmCookies = warm.headers?.['set-cookie'] || [];
 
-    // Login POST with cookies from warm-up
     const httpLogin = makeClient(variant, 'login');
     const cookieHeader = warmCookies.length ? { Cookie: warmCookies.map(c => String(c).split(';')[0]).join('; ') } : {};
     log(`LOGIN attempt ${attempt} ${variant} POST:`, LOGIN_URL);
@@ -301,7 +336,7 @@ export default async function handler(req, res) {
 
   const loginResp = await loginWithRetry(8);
   if (!loginResp) {
-    return res.status(502).json({ ok: false, error: 'Hotspot login failed (gateway)', detail: 'controller warmup/login 5xx or html' });
+    return res.status(502).json({ ok: false, error: 'Hotspot login failed (gateway)', detail: 'controller warmup or login did not produce token' });
   }
 
   const loginHeaders = loginResp.headers;
@@ -310,7 +345,7 @@ export default async function handler(req, res) {
   const csrf = loginHeaders?.['csrf-token'] || loginHeaders?.['Csrf-Token'] || loginData?.result?.token || null;
   if (!csrf) return res.status(502).json({ ok: false, error: 'Login returned no CSRF token' });
 
-  // 4) Omada authorize using duration from plan
+  // 4 Omada authorize using duration from plan
   const timeMsBase = Math.max(60000, Number(plan.durationMs || 0) || 60000);
   const strictHeaders = {
     Cookie: loginCookies.map(c => String(c).split(';')[0]).join('; '),
@@ -371,9 +406,8 @@ export default async function handler(req, res) {
     return res.status(502).json({ ok: false, error: 'Authorization failed', detail: last.data, attempt: last.note });
   }
 
-  // 5) Ledger debit + event
+  // 5 Ledger debit and event
   try {
-    // prepare ledger keys built earlier
     const cycleKey = localCycleKey(new Date(), APP_TZ);
     const { ledgerKey, eventsKey } = creditKeys(cycleKey, coworker.Id);
 
@@ -406,7 +440,7 @@ export default async function handler(req, res) {
     err('Ledger write error:', e?.message || e);
   }
 
-  // 6) Success
+  // 6 Success
   log('AUTH success -> redirect', redirectUrl);
   return res.status(200).json({
     ok: true,
