@@ -1,7 +1,7 @@
 // api/authorize.js  Vercel Node runtime, ESM style
-// Build: 2025-08-20k.5  (Basic time windows: 8:50 early, 9:00 to 4:10 day, 4:10 to 5:15 after, hard cut 5:15)
+// Build: 2025-08-20k.5a  (per-attempt Omada login client, Basic time windows wired)
 
-console.log("DEBUG: authorize.js build version 2025-08-20k.5");
+console.log("DEBUG: authorize.js build version 2025-08-20k.5a");
 
 export default async function handler(req, res) {
   const rid = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
@@ -113,7 +113,7 @@ export default async function handler(req, res) {
   if (!email) return res.status(400).json({ ok: false, error: 'Email is required on the splash form.' });
 
   // axios clients
-  const http = axios.create({
+  const sharedHttp = axios.create({
     timeout: 15000,
     httpsAgent: new (https.Agent)({ rejectUnauthorized: false }),
     headers: {
@@ -142,9 +142,9 @@ export default async function handler(req, res) {
     return Array.isArray(r.data?.Records) ? r.data.Records : [];
   }
 
-  /* Omada helpers */
+  /* HTTP helper for authorize attempts */
   const postJson = async (url, json, headers = {}) => {
-    const resp = await http.post(url, json, {
+    const resp = await sharedHttp.post(url, json, {
       headers: { 'Content-Type': 'application/json', ...headers },
       validateStatus: () => true
     });
@@ -188,9 +188,9 @@ export default async function handler(req, res) {
 
   // Map charge codes from planner to cents in your ledger
   function centsForCharge(code) {
-    if (code === 'daily') return SESSION_CENTS;       // 5 dollars
-    if (code === 'after_hours') return EXTEND_CENTS;  // 5 dollars
-    if (code === 'early') return SESSION_CENTS;       // 5 dollars
+    if (code === 'daily') return SESSION_CENTS;
+    if (code === 'after_hours') return EXTEND_CENTS;
+    if (code === 'early') return SESSION_CENTS;
     return 0;
   }
 
@@ -273,28 +273,48 @@ export default async function handler(req, res) {
     return res.status(502).json({ ok: false, error: 'Credit ledger unavailable' });
   }
 
-  // 3) Omada login with stronger retry
+  // 3) Omada login with per-attempt client to avoid poisoned sockets
   async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+  function makeLoginHttp(attempt) {
+    const agent = new https.Agent({ rejectUnauthorized: false, keepAlive: false, maxSockets: 1 });
+    const ua = `w2g-splash-login/${attempt}-${Math.random().toString(36).slice(2,6)}`;
+    return axios.create({
+      timeout: 12000,
+      httpsAgent: agent,
+      headers: {
+        Accept: 'application/json',
+        'User-Agent': ua,
+        Host: hostHeader,
+        Connection: 'close'
+      },
+      validateStatus: () => true
+    });
+  }
+
   async function loginWithRetry(max = 8) {
     const backoffs = [300, 600, 1000, 1500, 2500, 3500, 5000, 7000];
     for (let i = 1; i <= max; i++) {
+      const httpLocal = makeLoginHttp(i);
       log(`LOGIN attempt ${i}/${max}:`, LOGIN_URL);
-      const r = await postJson(
+      const resp = await httpLocal.post(
         LOGIN_URL,
         { name: OMADA_OPERATOR_USER, password: OMADA_OPERATOR_PASS },
-        { Host: hostHeader, Accept: 'application/json' }
+        { headers: { 'Content-Type': 'application/json' } }
       );
-      const isHtml = typeof r.data === 'string' && /<html/i.test(r.data);
-      const ok = r.status === 200 && !isHtml && r.data?.errorCode === 0;
-      if (ok) return r;
 
-      const retryableStatus = (r.status >= 500 && r.status <= 599) || r.status === 530;
+      const isHtml = typeof resp.data === 'string' && /<html/i.test(resp.data);
+      const ok = resp.status === 200 && !isHtml && resp.data?.errorCode === 0;
+      if (ok) return { data: resp.data, status: resp.status, headers: resp.headers, cookies: resp.headers?.['set-cookie'] || [] };
+
+      const retryableStatus = (resp.status >= 500 && resp.status <= 599) || resp.status === 530;
       const retryable = isHtml || retryableStatus;
       if (!retryable || i === max) {
-        err('LOGIN failed', r.status, 'detail:', isHtml ? '(html)' : JSON.stringify(r.data || {}));
+        err('LOGIN failed', resp.status, 'detail:', isHtml ? '(html)' : JSON.stringify(resp.data || {}));
         return null;
       }
-      await sleep(backoffs[i - 1] || 1000);
+      const jitter = Math.floor(Math.random() * 150);
+      await sleep((backoffs[i - 1] || 1000) + jitter);
     }
     return null;
   }
