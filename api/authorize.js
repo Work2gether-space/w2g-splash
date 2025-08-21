@@ -1,7 +1,7 @@
 // api/authorize.js  Vercel Node runtime, ESM style
-// Build: 2025-08-19k.4  (stronger Omada login retry: 8 attempts, HTML/530 retryable, explicit Host header)
+// Build: 2025-08-20k.5  (Basic time windows: 8:50 early, 9:00 to 4:10 day, 4:10 to 5:15 after, hard cut 5:15)
 
-console.log("DEBUG: authorize.js build version 2025-08-19k.4");
+console.log("DEBUG: authorize.js build version 2025-08-20k.5");
 
 export default async function handler(req, res) {
   const rid = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
@@ -76,13 +76,34 @@ export default async function handler(req, res) {
     redirectUrl
   });
 
+  // Bring in the time window planner from lib (CommonJS module)
+  let planBasicSession, EARLY_START_MIN, DAY_END_MIN, HARD_CUTOFF_MIN;
+  try {
+    const tw = await import('../lib/timeWindows.js');
+    const mod = tw.default || tw; // CJS interop
+    planBasicSession = mod.planBasicSession;
+    EARLY_START_MIN  = mod.EARLY_START_MIN;
+    DAY_END_MIN      = mod.DAY_END_MIN;
+    HARD_CUTOFF_MIN  = mod.HARD_CUTOFF_MIN;
+    if (typeof planBasicSession !== 'function') {
+      throw new Error('timeWindows module did not export planBasicSession');
+    }
+  } catch (e) {
+    err('Failed to load timeWindows.js:', e?.message || e);
+    return res.status(500).json({ ok: false, error: 'Server config error: timeWindows' });
+  }
+
   // Redis
   let redis;
   try {
     const { getRedis } = await import('../lib/redis.js');
     log('Redis ping start');
     redis = await getRedis();
-    await redis.set(`w2g:auth-ping:${clientMacRaw || 'unknown'}`, JSON.stringify({ when: new Date().toISOString(), site: omadaSite }), { EX: 300 });
+    await redis.set(
+      `w2g:auth-ping:${clientMacRaw || 'unknown'}`,
+      JSON.stringify({ when: new Date().toISOString(), site: omadaSite }),
+      { EX: 300 }
+    );
   } catch (e) {
     console.error(`[authorize][${rid}] Redis connect error`, e?.message || e);
     return res.status(502).json({ ok: false, error: 'Redis unavailable' });
@@ -121,31 +142,6 @@ export default async function handler(req, res) {
     return Array.isArray(r.data?.Records) ? r.data.Records : [];
   }
 
-  /* Time policy (NY) */
-  function computeBasicPolicyTZ(nowUtc, tz) {
-    const t = new Date(nowUtc);
-    const fmt = new Intl.DateTimeFormat('en-US', { timeZone: tz, hour12: false, hour: '2-digit', minute: '2-digit', weekday: 'short' });
-    const parts = fmt.formatToParts(t);
-    const hour = Number(parts.find(p => p.type === 'hour')?.value || '0');
-    const minute = Number(parts.find(p => p.type === 'minute')?.value || '0');
-    const weekday = String(parts.find(p => p.type === 'weekday')?.value || '');
-    const mins = hour * 60 + minute;
-    if (weekday === 'Sat' || weekday === 'Sun') return { allowed: false, reason: 'Not available on weekends' };
-    const start = 9 * 60, lateStart = 16 * 60, hardCut = 16 * 60 + 15;
-    if (mins < start) return { allowed: false, reason: 'Access starts at 09:00' };
-    if (mins >= hardCut) return { allowed: false, reason: 'Closed for the day' };
-    if (mins >= lateStart) return { allowed: true, phase: 'late', msRemaining: Math.max(60000, (hardCut - mins) * 60000), cutoffISO: toCutoffISO(t, tz, hardCut) };
-    return { allowed: true, phase: 'standard', msRemaining: Math.max(60000, (lateStart - mins) * 60000), cutoffISO: toCutoffISO(t, tz, lateStart) };
-  }
-  function toCutoffISO(nowUtcDate, tz, cutoffMins) {
-    const now = new Date(nowUtcDate);
-    const dFmt = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' });
-    const dateStr = dFmt.format(now);
-    const hh = String(Math.floor(cutoffMins / 60)).padStart(2, '0');
-    const mm = String(cutoffMins % 60).padStart(2, '0');
-    return new Date(`${dateStr}T${hh}:${mm}:00`).toISOString();
-  }
-
   /* Omada helpers */
   const postJson = async (url, json, headers = {}) => {
     const resp = await http.post(url, json, {
@@ -167,11 +163,14 @@ export default async function handler(req, res) {
     return `${yFmt.format(date)}-${mFmt.format(date)}`;
   }
   function creditKeys(cycleKey, coworkerId) {
-    return { ledgerKey: `w2g:credits:${cycleKey}:${coworkerId}`, eventsKey: `w2g:ledger:${cycleKey}:${coworkerId}` };
+    return {
+      ledgerKey: `w2g:credits:${cycleKey}:${coworkerId}`,
+      eventsKey: `w2g:ledger:${cycleKey}:${coworkerId}`
+    };
   }
   async function getOrInitLedger(redis, ledgerKey, seed) {
     const existing = await redis.get(ledgerKey);
-    if (existing) { try { return JSON.parse(existing); } catch { /*ignore*/ } }
+    if (existing) { try { return JSON.parse(existing); } catch { /* ignore parse issue */ } }
     await redis.set(ledgerKey, JSON.stringify(seed));
     return seed;
   }
@@ -187,13 +186,22 @@ export default async function handler(req, res) {
     return hex.match(/.{1,2}/g).join('-');
   };
 
+  // Map charge codes from planner to cents in your ledger
+  function centsForCharge(code) {
+    if (code === 'daily') return SESSION_CENTS;       // 5 dollars
+    if (code === 'after_hours') return EXTEND_CENTS;  // 5 dollars
+    if (code === 'early') return SESSION_CENTS;       // 5 dollars
+    return 0;
+  }
+
   /* Flow */
 
-  // 0) Nexudus precheck
+  // 0) Nexudus precheck for membership
   let coworker, hasBasic = false, hasClassic = false, has247 = false;
   try {
     coworker = await nxGetCoworkerByEmail(email);
     if (!coworker) return res.status(403).json({ ok: false, error: 'Account not found in Nexudus' });
+
     log(`Nexudus coworker id=${coworker.Id} name=${coworker.FullName}`);
     const contracts = await nxGetActiveContracts(coworker.Id);
     const names = contracts.map(c => String(c.TariffName || '').trim().toLowerCase());
@@ -201,35 +209,50 @@ export default async function handler(req, res) {
     hasClassic = names.some(n => n.includes('classic'));
     has247 = names.some(n => n.includes('24') || n.includes('247'));
     log(`Active contracts=${contracts.length} hasBasic=${hasBasic} hasClassic=${hasClassic} has247=${has247}`);
+
     if ((ssidName || '').toLowerCase().includes('basic') && !hasBasic && !hasClassic && !has247) {
       return res.status(403).json({ ok: false, error: 'Basic plan required for this SSID' });
-    }
-    if (hasBasic) {
-      const policy = computeBasicPolicyTZ(new Date(), APP_TZ);
-      if (!policy.allowed) return res.status(403).json({ ok: false, error: policy.reason });
     }
   } catch (e) {
     err('Nexudus precheck error:', e?.message || e);
     return res.status(502).json({ ok: false, error: 'Nexudus precheck failed' });
   }
 
-  // 1) Debit computation
+  // 1) Build the time-window plan and compute debit requirement
   const isBasic = hasBasic;
-  const policyNow = isBasic ? computeBasicPolicyTZ(new Date(), APP_TZ) : { allowed: true, phase: 'standard', msRemaining: 3600000, cutoffISO: new Date(Date.now() + 3600000).toISOString() };
-  if (isBasic && !policyNow.allowed) return res.status(403).json({ ok: false, error: policyNow.reason });
-  let requiredCents = 0, debitReason = 'none';
-  if (isBasic) {
-    if (policyNow.phase === 'standard') { requiredCents = SESSION_CENTS + (extend ? EXTEND_CENTS : 0); debitReason = extend ? 'standard+extend' : 'standard'; }
-    else { if (!extend) return res.status(402).json({ ok: false, error: 'Extra hour required. Select Extend to continue.' });
-           requiredCents = SESSION_CENTS + EXTEND_CENTS; debitReason = 'late+extend'; }
+  let plan;
+  try {
+    plan = isBasic
+      ? planBasicSession({ nowTs: Date.now(), extend: Boolean(extend) })
+      : { allow: true, reason: 'Non Basic path', durationMs: 60 * 60 * 1000, charges: [], window: 'open' };
+
+    if (!plan.allow) {
+      log(`Basic plan deny: reason="${plan.reason}" window="${plan.window}" email=${email}`);
+      return res.status(403).json({ ok: false, error: plan.reason });
+    }
+  } catch (e) {
+    err('Time planner error:', e?.message || e);
+    return res.status(500).json({ ok: false, error: 'Time planner failed' });
   }
 
-  // 2) Ensure credits (init + reconcile to env cap)
+  // Sum required cents for this authorization
+  const totalRequiredCents = plan.charges.reduce((sum, ch) => sum + centsForCharge(ch.code), 0);
+
+  // 2) Ensure credits exist and are sufficient for this authorization
   let ledgerKey, eventsKey, ledger;
   try {
     const cycleKey = localCycleKey(new Date(), APP_TZ);
     ({ ledgerKey, eventsKey } = creditKeys(cycleKey, coworker.Id));
-    const seed = { coworkerId: coworker.Id, email, plan: isBasic ? 'basic' : (hasClassic ? 'classic' : (has247 ? '247' : 'other')), cycle: cycleKey, remainingCents: MONTHLY_CENTS, spentCents: 0, checkins: 0, lastUpdated: new Date().toISOString() };
+    const seed = {
+      coworkerId: coworker.Id,
+      email,
+      plan: isBasic ? 'basic' : (hasClassic ? 'classic' : (has247 ? '247' : 'other')),
+      cycle: cycleKey,
+      remainingCents: MONTHLY_CENTS,
+      spentCents: 0,
+      checkins: 0,
+      lastUpdated: new Date().toISOString()
+    };
     ledger = await getOrInitLedger(redis, ledgerKey, seed);
 
     const currentCap = Number(ledger.remainingCents || 0) + Number(ledger.spentCents || 0);
@@ -241,12 +264,12 @@ export default async function handler(req, res) {
       log(`Ledger reconciled ${ledgerKey} +${bump} to match MONTHLY_CENTS=${MONTHLY_CENTS}`);
     }
 
-    if (isBasic && Number(ledger.remainingCents) < requiredCents) {
-      log(`Insufficient credits remaining=${ledger.remainingCents} required=${requiredCents}`);
+    if (isBasic && Number(ledger.remainingCents) < totalRequiredCents) {
+      log(`Insufficient credits remaining=${ledger.remainingCents} required=${totalRequiredCents}`);
       return res.status(402).json({ ok: false, error: 'Not enough credits for WiFi session' });
     }
   } catch (e) {
-    err('Ledger init/reconcile error:', e?.message || e);
+    err('Ledger init or check error:', e?.message || e);
     return res.status(502).json({ ok: false, error: 'Credit ledger unavailable' });
   }
 
@@ -256,8 +279,11 @@ export default async function handler(req, res) {
     const backoffs = [300, 600, 1000, 1500, 2500, 3500, 5000, 7000];
     for (let i = 1; i <= max; i++) {
       log(`LOGIN attempt ${i}/${max}:`, LOGIN_URL);
-      // new agent each loop (in case a socket got poisoned)
-      const r = await postJson(LOGIN_URL, { name: OMADA_OPERATOR_USER, password: OMADA_OPERATOR_PASS }, { Host: hostHeader, Accept: 'application/json' });
+      const r = await postJson(
+        LOGIN_URL,
+        { name: OMADA_OPERATOR_USER, password: OMADA_OPERATOR_PASS },
+        { Host: hostHeader, Accept: 'application/json' }
+      );
       const isHtml = typeof r.data === 'string' && /<html/i.test(r.data);
       const ok = r.status === 200 && !isHtml && r.data?.errorCode === 0;
       if (ok) return r;
@@ -274,7 +300,9 @@ export default async function handler(req, res) {
   }
 
   const loginResp = await loginWithRetry(8);
-  if (!loginResp) return res.status(502).json({ ok: false, error: 'Hotspot login failed (gateway)', detail: 'controller 5xx/html' });
+  if (!loginResp) {
+    return res.status(502).json({ ok: false, error: 'Hotspot login failed (gateway)', detail: 'controller 5xx or html' });
+  }
 
   const { data: loginData, headers: loginHeaders, cookies: loginCookies } = loginResp;
   const csrf = loginHeaders?.['csrf-token'] || loginHeaders?.['Csrf-Token'] || loginData?.result?.token || null;
@@ -285,11 +313,8 @@ export default async function handler(req, res) {
   const cookieHeader = cookiePairs.length ? { Cookie: cookiePairs.join('; ') } : {};
   log('Login cookies parsed count=', cookiePairs.length, 'csrf(len)=', String(csrf || '').length);
 
-  // 4) Omada authorize — compatibility matrix
-  const timeMsBase = Math.max(60000, Number((() => {
-    const policy = computeBasicPolicyTZ(new Date(), APP_TZ);
-    return policy.msRemaining || 60000;
-  })()) || 60000);
+  // 4) Omada authorize with duration from plan
+  const timeMsBase = Math.max(60000, Number(plan.durationMs || 0) || 60000);
   const timeUnits = [
     { label: 'ms', value: timeMsBase },
     { label: 'us', value: timeMsBase * 1000 },
@@ -341,8 +366,20 @@ export default async function handler(req, res) {
     return res.status(502).json({ ok: false, error: 'Authorization failed', detail: last.data, attempt: last.note });
   }
 
-  // 5) Record debit
+  // 5) Record debit and event
   try {
+    const debitCents = isBasic ? totalRequiredCents : 0;
+
+    if (isBasic && debitCents > 0) {
+      const current = JSON.parse(await redis.get(ledgerKey));
+      current.remainingCents = Math.max(0, Number(current.remainingCents) - debitCents);
+      current.spentCents = Number(current.spentCents) + debitCents;
+      current.checkins = Number(current.checkins) + 1;
+      current.lastUpdated = new Date().toISOString();
+      await redis.set(ledgerKey, JSON.stringify(current));
+      log(`Ledger debited ${debitCents}c -> remaining=${current.remainingCents} spent=${current.spentCents}`);
+    }
+
     const event = {
       when: new Date().toISOString(),
       clientMac: macToColons(clientMacRaw),
@@ -350,33 +387,27 @@ export default async function handler(req, res) {
       ssidName,
       site: omadaSite,
       durationMs: timeMsBase,
-      phase: computeBasicPolicyTZ(new Date(), APP_TZ).phase,
+      window: plan.window,
       extend: !!extend,
-      debitCents: isBasic ? (computeBasicPolicyTZ(new Date(), APP_TZ).phase === 'standard'
-                   ? (Number(BASIC_SESSION_CENTS) + (extend ? Number(BASIC_EXTEND_CENTS) : 0))
-                   : (extend ? (Number(BASIC_SESSION_CENTS) + Number(BASIC_EXTEND_CENTS)) : 0))
-                 : 0,
-      reason: (computeBasicPolicyTZ(new Date(), APP_TZ).phase === 'standard' ? (extend ? 'standard+extend' : 'standard') : (extend ? 'late+extend' : 'late'))
+      debitCents,
+      charges: plan.charges,
+      reason: plan.reason
     };
-    // Update ledger
-    if (isBasic) {
-      const debit = event.debitCents || 0;
-      const current = JSON.parse(await redis.get(ledgerKey));
-      current.remainingCents = Math.max(0, Number(current.remainingCents) - debit);
-      current.spentCents = Number(current.spentCents) + debit;
-      current.checkins = Number(current.checkins) + 1;
-      current.lastUpdated = new Date().toISOString();
-      await redis.set(ledgerKey, JSON.stringify(current));
-    }
     await redis.lPush(eventsKey, JSON.stringify(event));
-    log(`Ledger updated ${ledgerKey} remaining=${(await redis.get(ledgerKey) ? JSON.parse(await redis.get(ledgerKey)).remainingCents : 'n/a')} spent=${(await redis.get(ledgerKey) ? JSON.parse(await redis.get(ledgerKey)).spentCents : 'n/a')}`);
   } catch (e) {
     err('Ledger write error:', e?.message || e);
   }
 
   // 6) Success
   log('AUTH success -> redirect', redirectUrl);
-  return res.status(200).json({ ok: true, redirectUrl, cutoff: computeBasicPolicyTZ(new Date(), APP_TZ).cutoffISO, extended: !!extend });
+  return res.status(200).json({
+    ok: true,
+    redirectUrl,
+    cutoff: new Date(Date.now() + timeMsBase).toISOString(),
+    extended: !!extend,
+    window: plan.window,
+    message: plan.reason
+  });
 }
 
 /* utils */
