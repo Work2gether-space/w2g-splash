@@ -1,7 +1,7 @@
 // api/authorize.js  Vercel Node runtime, ESM style
-// Build: 2025-08-26b  step 3.4c omada debug + redis probe + daily debit write
+// Build: 2025-08-26c  step 3.4c — omada debug + redis probe + daily debit write + LEDGER READ-BACK
 
-console.log("DEBUG: authorize.js build version 2025-08-26b");
+console.log("DEBUG: authorize.js build version 2025-08-26c");
 
 export default async function handler(req, res) {
   const rid = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
@@ -40,7 +40,6 @@ export default async function handler(req, res) {
   }
   if (!NEXUDUS_BASE || !NEXUDUS_USER || !NEXUDUS_PASS) {
     err('Missing env vars. Need NEXUDUS_BASE, NEXUDUS_USER, NEXUDUS_PASS.');
-    // allow probes to proceed if Nexudus is not configured
   }
 
   const base = OMADA_BASE.replace(/\/+$/, '');
@@ -115,7 +114,7 @@ export default async function handler(req, res) {
     try {
       const { getRedis } = await import('../lib/redis.js');
       const url = process.env.REDIS_URL || '';
-      let host='(unknown)', port='(unknown)', db='0';
+      let host='(unknown)', port='(default)', db='0';
       try {
         const u = new URL(url);
         host = u.hostname || host;
@@ -139,6 +138,34 @@ export default async function handler(req, res) {
     } catch (e) {
       err('redis probe error', e?.message || e);
       return res.status(500).json({ ok: false, probe: 'redis', error: String(e?.message || e) });
+    }
+  }
+  // ---------- PROBE: LEDGER READ-BACK (session, events, daily debit) ----------
+  if (dbgProbe === 'ledger') {
+    if (!clientMacRaw) return res.status(400).json({ ok:false, error:'Missing clientMac for ledger probe' });
+    try {
+      const { getRedis } = await import('../lib/redis.js');
+      const r = await getRedis();
+      const today = localDateKey(new Date(), APP_TZ);
+      const macKey = `w2g:session:${macPlainLower(clientMacRaw)}`;
+      const sessionJson = await r.get(macKey);
+      // try to infer coworkerId from session if not supplied
+      let coworkerId = null; try { coworkerId = JSON.parse(sessionJson || '{}').coworkerId || null; } catch {}
+      const debitKey = coworkerId ? `w2g:debits:${today}:${coworkerId}` : null;
+      const debitVal = debitKey ? await r.get(debitKey) : null;
+      const eventsKey = coworkerId ? `w2g:ledger:${localCycleKey(new Date(), APP_TZ)}:${coworkerId}` : null;
+      const eventsSlice = eventsKey ? await r.lRange(eventsKey, 0, 19) : [];
+      return res.status(200).json({
+        ok: true,
+        probe: 'ledger',
+        keys: { sessionKey: macKey, debitKey, eventsKey },
+        session: sessionJson ? JSON.parse(sessionJson) : null,
+        debitCount: debitVal ? Number(debitVal) : null,
+        events: eventsSlice.map(s => { try { return JSON.parse(s); } catch { return s; } })
+      });
+    } catch (e) {
+      err('ledger read-back error', e?.message || e);
+      return res.status(500).json({ ok:false, probe:'ledger', error:String(e?.message || e) });
     }
   }
   // -------------------------------------------------------------------
@@ -447,4 +474,17 @@ export default async function handler(req, res) {
     message: plan.reason,
     ...includeDebug
   });
+}
+
+// ---------- helpers used by probes ----------
+function localCycleKey(date = new Date(), tz = 'America/New_York') {
+  const yFmt = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric' });
+  const mFmt = new Intl.DateTimeFormat('en-CA', { timeZone: tz, month: '2-digit' });
+  return `${yFmt.format(date)}-${mFmt.format(date)}`;
+}
+function localDateKey(date = new Date(), tz = 'America/New_York') {
+  const y = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric' }).format(date);
+  const m = new Intl.DateTimeFormat('en-CA', { timeZone: tz, month: '2-digit' }).format(date);
+  const d = new Intl.DateTimeFormat('en-CA', { timeZone: tz, day: '2-digit' }).format(date);
+  return `${y}-${m}-${d}`;
 }
