@@ -33,7 +33,7 @@
 <body>
   <div class="card">
     <h1>Welcome to Work2gether</h1>
-    <p>Please log in to start your session</p>
+    <p>Basic hours: Mon to Fri, 9:00 a.m. to 4:00 p.m.</p>
 
     <!-- Live status about today's window -->
     <div id="status" class="status" role="status" aria-live="polite" style="display:none;"></div>
@@ -45,7 +45,7 @@
 
       <div class="field row">
         <input type="checkbox" id="extend" />
-        <label for="extend" id="extendLabel">Extend +60 minutes (after-hours fee applies)</label>
+        <label for="extend" id="extendLabel">Extend up to 60 minutes after 4:10 p.m. ET</label>
       </div>
       <div class="hint" id="extendHint"></div>
 
@@ -64,11 +64,12 @@
   </div>
 
   <script>
-    // --- Constants: splash displays ET windows to match backend rules ---
+    // --- Constants: match backend rules exactly (ET) ---
     const ET_TZ = "America/New_York";
-    const EARLY_START_MIN = 8 * 60 + 50;  // 8:50
-    const DAY_END_MIN     = 16 * 60 + 10; // 4:10
-    const HARD_CUTOFF_MIN = 17 * 60 + 15; // 5:15
+    const HARD_DENY_EARLY_MIN = 7 * 60 + 30; // 7:30 a.m. hard deny before this for Basic
+    const EARLY_END_MIN       = 8 * 60 + 50; // 8:50 a.m. end of early slip window
+    const DAY_END_MIN         = 16 * 60 + 10; // 4:10 p.m. end of normal window
+    const HARD_CUTOFF_MIN     = 17 * 60 + 30; // 5:30 p.m. hard cutoff (aligned to policy)
 
     function etNowMinutes() {
       const fmt = new Intl.DateTimeFormat("en-US", { timeZone: ET_TZ, hour12: false, hour: "2-digit", minute: "2-digit" });
@@ -83,41 +84,69 @@
       const d = new Date();
       const ymd = new Intl.DateTimeFormat("en-CA", { timeZone: ET_TZ, year: "numeric", month: "2-digit", day: "2-digit" }).format(d);
       const hh = String(h).padStart(2, "0"), mm = String(m).padStart(2, "0");
-      const iso = new Date(`${ymd}T${hh}:${mm}:00`).toLocaleTimeString([], { hour: "numeric", minute: "2-digit", timeZone: ET_TZ });
-      return iso; // e.g., "4:10 PM"
+      // Localize to ET nicely, e.g. "4:10 PM"
+      return new Date(`${ymd}T${hh}:${mm}:00`).toLocaleTimeString([], { hour: "numeric", minute: "2-digit", timeZone: ET_TZ });
     }
 
     function computeDisplayPlan() {
       const nowMin = etNowMinutes();
-      if (nowMin >= HARD_CUTOFF_MIN) {
-        return { window: "closed", message: "Internet access ends at 5:15 PM ET.", details: "Please reconnect tomorrow during Basic hours.", extendEnabled: false };
+
+      // 1) Before 7:30 a.m. — hard deny
+      if (nowMin < HARD_DENY_EARLY_MIN) {
+        return {
+          window: "closed-early",
+          message: "Access not available yet",
+          details: "Basic access begins at 9:00 a.m. ET. Standard or Premium is required earlier.",
+          extendEnabled: false,
+          allowSubmit: false
+        };
       }
-      if (nowMin < EARLY_START_MIN) {
+
+      // 2) 7:30 to 8:50 a.m. — early slip window
+      if (nowMin < EARLY_END_MIN) {
         const until = formatEtTime(DAY_END_MIN);
         return {
           window: "early",
           message: "Early access window",
-          details: `You can log in now. Charges: $5 early access + $5 day. Session runs until ${until}.`,
-          extendEnabled: false
+          details: `Deduction today: 5 credits early + 5 credits day. Session runs until ${until}.`,
+          extendEnabled: false,
+          allowSubmit: true
         };
       }
+
+      // 3) 8:50 a.m. to 4:10 p.m. — normal day window
       if (nowMin < DAY_END_MIN) {
         const until = formatEtTime(DAY_END_MIN);
         return {
           window: "day",
           message: "Day access window",
-          details: `Charges: $5 daily. Session runs until ${until}.`,
-          extendEnabled: false
+          details: `Deduction today: 5 credits day. Session runs until ${until}.`,
+          extendEnabled: false,
+          allowSubmit: true
         };
       }
-      const toHard = minutesUntil(HARD_CUTOFF_MIN, nowMin);
-      const granted = Math.min(60, toHard);
-      const endingAt = formatEtTime(nowMin + granted);
+
+      // 4) 4:10 p.m. to 5:30 p.m. — extended window
+      if (nowMin < HARD_CUTOFF_MIN) {
+        const toHard = minutesUntil(HARD_CUTOFF_MIN, nowMin);
+        const granted = Math.min(60, toHard);
+        const endingAt = formatEtTime(nowMin + granted);
+        return {
+          window: "after",
+          message: "Extended window",
+          details: `Deduction today: 5 credits extended. Up to 60 minutes, ending by ${endingAt}. Hard cutoff is 5:30 p.m. ET.`,
+          extendEnabled: true,
+          allowSubmit: true
+        };
+      }
+
+      // 5) After 5:30 p.m. — hard cutoff
       return {
-        window: "after",
-        message: "After-hours window",
-        details: `Charges: $5 after-hours. Up to 60 minutes, ending by ${endingAt} (hard cutoff 5:15 PM ET).`,
-        extendEnabled: true
+        window: "closed",
+        message: "Access has ended for today",
+        details: "Basic ends at 4:00 p.m. ET. Extended ends at 5:30 p.m. ET.",
+        extendEnabled: false,
+        allowSubmit: false
       };
     }
 
@@ -126,17 +155,24 @@
     const get = (k) => qs.get(k) || '';
     const first = (...names) => { for (const n of names) { const v = get(n); if (v) return v; } return ''; };
 
+    // Normalize redirect targets so we avoid captive-portal probe URLs that break Omada/CF
+    function normalizeRedirect(url) {
+      if (!url) return 'http://neverssl.com';
+      try { url = decodeURIComponent(url); } catch {}
+      // Replace well-known probe URLs with a safe target
+      if (/captiveportal|connecttest|generate_204|msftconnecttest|wifiportal/i.test(url)) {
+        return 'http://neverssl.com';
+      }
+      return url;
+    }
+
     const params = {
       clientMac: first('clientMac', 'client_id'),
       apMac: first('apMac', 'gatewayMac'),
       ssidName: first('ssidName', 'ssid'),
       radioId: first('radioId', 'radio'),
       site: get('site'),
-      redirectUrl: (() => {
-        const r = get('redirectUrl');
-        try { return r ? decodeURIComponent(r) : 'http://neverssl.com'; }
-        catch { return 'http://neverssl.com'; }
-      })()
+      redirectUrl: normalizeRedirect(get('redirectUrl') || 'http://neverssl.com')
     };
 
     // Fill hidden inputs
@@ -152,6 +188,9 @@
     const extendBox = document.getElementById('extend');
     const extendLabel = document.getElementById('extendLabel');
     const extendHint = document.getElementById('extendHint');
+    const submitBtn = document.getElementById('submitBtn');
+    const errorDiv = document.getElementById('error');
+
     function refreshStatus() {
       const plan = computeDisplayPlan();
       statusDiv.style.display = 'block';
@@ -161,15 +200,32 @@
       if (plan.extendEnabled) {
         extendBox.disabled = false;
         extendLabel.classList.remove('disabled');
-        extendHint.textContent = "Extend adds up to 60 minutes and deducts $5. It never goes past 5:15 PM ET.";
+        extendHint.textContent = "Extended adds up to 60 minutes and deducts 5 credits. It never goes past 5:30 p.m. ET.";
       } else {
         extendBox.checked = false;
         extendBox.disabled = true;
         extendLabel.classList.add('disabled');
-        if (plan.window === 'closed') {
-          extendHint.textContent = "Access has ended for today.";
+        if (plan.window === 'closed' || plan.window === 'closed-early') {
+          extendHint.textContent = "Extended is not available right now.";
         } else {
-          extendHint.textContent = "Extend becomes available after 4:10 PM ET.";
+          extendHint.textContent = "Extended becomes available after 4:10 p.m. ET.";
+        }
+      }
+
+      // Disable submit if out of policy
+      submitBtn.disabled = !plan.allowSubmit;
+      if (!plan.allowSubmit) {
+        errorDiv.textContent = (plan.window === 'closed-early')
+          ? 'Basic access is not available yet. Please reconnect later.'
+          : (plan.window === 'closed')
+            ? 'Internet access has ended for today.'
+            : '';
+      } else {
+        // Do not overwrite server errors from previous attempt
+        if (errorDiv.textContent === 'Please connect to the W2G_Basic Wi-Fi and try again.' ||
+            errorDiv.textContent === 'Basic access is not available yet. Please reconnect later.' ||
+            errorDiv.textContent === 'Internet access has ended for today.') {
+          errorDiv.textContent = '';
         }
       }
     }
@@ -177,25 +233,33 @@
     // Re-check status every minute in case someone leaves the page open
     setInterval(refreshStatus, 60000);
 
-    // If not on the Wi‑Fi (missing essentials), disable submit with a friendly hint
+    // If not on the Wi-Fi (missing essentials), disable submit with a friendly hint
     const essentialsMissing = !params.clientMac || !params.apMac || !params.ssidName || params.radioId === '' || !params.site;
-    const submitBtn = document.getElementById('submitBtn');
-    const errorDiv = document.getElementById('error');
     if (essentialsMissing) {
       submitBtn.disabled = true;
-      errorDiv.textContent = 'Please connect to the W2G_Basic Wi‑Fi and try again.';
+      errorDiv.textContent = 'Please connect to the W2G_Basic Wi-Fi and try again.';
     }
 
     // Submit handler (server is authoritative; UI is only guidance)
     document.getElementById('loginForm').addEventListener('submit', async (e) => {
       e.preventDefault();
       if (submitBtn.disabled) return;
+
+      const emailEl = document.getElementById('email');
+      const emailVal = emailEl.value.trim();
       errorDiv.textContent = '';
+
+      if (!emailVal) {
+        errorDiv.textContent = 'Please enter your email.';
+        emailEl.focus();
+        return;
+      }
+
       submitBtn.disabled = true;
-      submitBtn.textContent = 'Authorizing…';
+      submitBtn.textContent = 'Authorizing...';
 
       const payload = {
-        email: document.getElementById('email').value.trim(),
+        email: emailVal,
         clientMac: params.clientMac,
         apMac: params.apMac,
         ssidName: params.ssidName,
