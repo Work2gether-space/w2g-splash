@@ -1,7 +1,7 @@
 // api/authorize.js  Vercel Node runtime, ESM style
-// Build: 2025-08-26a  step 3.4c omada debug + daily debit write
+// Build: 2025-08-26b  step 3.4c omada debug + redis probe + daily debit write
 
-console.log("DEBUG: authorize.js build version 2025-08-26a");
+console.log("DEBUG: authorize.js build version 2025-08-26b");
 
 export default async function handler(req, res) {
   const rid = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
@@ -99,7 +99,6 @@ export default async function handler(req, res) {
       return s.length > n ? s.slice(0, n) + '…' : s;
     } catch { return '(unserializable)'; }
   }
-
   function pickHeaders(h) {
     const out = {};
     for (const k of Object.keys(h || {})) {
@@ -111,60 +110,38 @@ export default async function handler(req, res) {
     return out;
   }
 
-  // probe for controller login only
-  if (dbgProbe === 'login') {
+  // ---------- PROBE: REDIS (env + connectivity + write test) ----------
+  if (dbgProbe === 'redis') {
     try {
-      const attempts = [];
-      function makeClient(purpose) {
-        const agent = new https.Agent({ rejectUnauthorized: false, keepAlive: false, maxSockets: 1 });
-        const headers = {
-          Accept: 'application/json,text/html;q=0.9,*/*;q=0.1',
-          'User-Agent': `w2g-splash-${purpose}/${Math.random().toString(36).slice(2,7)}`,
-          Connection: 'close',
-          'Cache-Control': 'no-cache',
-          Pragma: 'no-cache',
-          'Accept-Language': 'en-US,en;q=0.9'
-        };
-        if (purpose === 'login') {
-          headers['Origin'] = base;
-          headers['Referer'] = PORTAL_URL;
-        }
-        return axios.create({ timeout: 12000, httpsAgent: agent, headers, validateStatus: () => true, maxRedirects: 0 });
-      }
-
-      const warm = await makeClient('warmup').get(PORTAL_URL);
-      const warmCookies = warm.headers?.['set-cookie'] || [];
-      attempts.push({ stage: 'warmup', status: warm.status, headers: pickHeaders(warm.headers) });
-
-      for (const loginUrl of [LOGIN_URL_STD, LOGIN_URL_ALT]) {
-        const httpLogin = makeClient('login');
-        const cookieHeader = warmCookies.length ? { Cookie: warmCookies.map(c => String(c).split(';')[0]).join('; ') } : {};
-        const resp = await httpLogin.post(
-          loginUrl,
-          { name: OMADA_OPERATOR_USER, password: OMADA_OPERATOR_PASS },
-          { headers: { 'Content-Type': 'application/json', ...cookieHeader } }
-        );
-        const hdrs = pickHeaders(resp.headers || {});
-        const token = hdrs['csrf-token'] || hdrs['Csrf-Token'] || resp.data?.result?.token || null;
-        attempts.push({
-          stage: 'login',
-          url: loginUrl,
-          status: resp.status,
-          tokenPresent: !!token,
-          headers: hdrs,
-          body: truncate(resp.data, 400)
-        });
-        if (token) {
-          return res.status(200).json({ ok: true, probe: 'login', attempts });
-        }
-      }
-
-      return res.status(502).json({ ok: false, probe: 'login', attempts });
+      const { getRedis } = await import('../lib/redis.js');
+      const url = process.env.REDIS_URL || '';
+      let host='(unknown)', port='(unknown)', db='0';
+      try {
+        const u = new URL(url);
+        host = u.hostname || host;
+        port = u.port || '(default)';
+        const p = (u.pathname || '').replace(/^\//,'').trim();
+        db = p || '0';
+      } catch {}
+      const r = await getRedis();
+      const pong = await r.ping();
+      const writeKey = `w2g:probe:${Date.now()}`;
+      await r.set(writeKey, 'ok', { EX: 120 });
+      const dbsize = Number(await r.sendCommand(['DBSIZE']));
+      return res.status(200).json({
+        ok: true,
+        probe: 'redis',
+        redis: { urlSet: !!url, host, port, db },
+        ping: pong,
+        writeKey,
+        dbsize
+      });
     } catch (e) {
-      err('login probe error', e?.message || e);
-      return res.status(500).json({ ok: false, probe: 'login', error: String(e?.message || e) });
+      err('redis probe error', e?.message || e);
+      return res.status(500).json({ ok: false, probe: 'redis', error: String(e?.message || e) });
     }
   }
+  // -------------------------------------------------------------------
 
   // request validation
   if (!clientMacRaw || !siteId) {
@@ -228,7 +205,6 @@ export default async function handler(req, res) {
   }
 
   function toInt(v, d) { const n = Number(v); return Number.isFinite(n) ? Math.round(n) : d; }
-
   function localCycleKey(date = new Date(), tz = APP_TZ) {
     const yFmt = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric' });
     const mFmt = new Intl.DateTimeFormat('en-CA', { timeZone: tz, month: '2-digit' });
@@ -448,7 +424,6 @@ export default async function handler(req, res) {
     err('Events write error', e?.message || e);
   }
   try {
-    // simple daily debit counter for 3.4c validation
     if (isBasic) {
       await redis.incr(`w2g:debits:${dateKey}:${coworker.Id}`);
     }
