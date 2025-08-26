@@ -1,7 +1,7 @@
 // api/authorize.js  Vercel Node runtime, ESM style
-// Build: 2025-08-26c  step 3.4c — omada debug + redis probe + daily debit write + LEDGER READ-BACK
+// Build: 2025-08-26e  step 3.5B — credit enforcement (early/session/extended) + idempotent per-day debits + ledger apply
 
-console.log("DEBUG: authorize.js build version 2025-08-26c");
+console.log("DEBUG: authorize.js build version 2025-08-26e");
 
 export default async function handler(req, res) {
   const rid = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
@@ -29,9 +29,11 @@ export default async function handler(req, res) {
 
     APP_TZ = 'America/New_York',
 
-    BASIC_MONTHLY_CENTS = '7500',
-    BASIC_SESSION_CENTS = '500',
-    BASIC_EXTEND_CENTS  = '500'
+    // Credit economics
+    BASIC_MONTHLY_CENTS = '7500',   // Monthly Basic pool
+    BASIC_SESSION_CENTS = '500',    // Normal session deduction
+    BASIC_EXTEND_CENTS  = '500',    // Extended window deduction
+    BASIC_EARLY_CENTS   = '500'     // Early window deduction
   } = process.env;
 
   if (!OMADA_BASE || !OMADA_CONTROLLER_ID || !OMADA_OPERATOR_USER || !OMADA_OPERATOR_PASS) {
@@ -140,6 +142,7 @@ export default async function handler(req, res) {
       return res.status(500).json({ ok: false, probe: 'redis', error: String(e?.message || e) });
     }
   }
+
   // ---------- PROBE: LEDGER READ-BACK (session, events, daily debit) ----------
   if (dbgProbe === 'ledger') {
     if (!clientMacRaw) return res.status(400).json({ ok:false, error:'Missing clientMac for ledger probe' });
@@ -149,18 +152,17 @@ export default async function handler(req, res) {
       const today = localDateKey(new Date(), APP_TZ);
       const macKey = `w2g:session:${macPlainLower(clientMacRaw)}`;
       const sessionJson = await r.get(macKey);
-      // try to infer coworkerId from session if not supplied
       let coworkerId = null; try { coworkerId = JSON.parse(sessionJson || '{}').coworkerId || null; } catch {}
-      const debitKey = coworkerId ? `w2g:debits:${today}:${coworkerId}` : null;
-      const debitVal = debitKey ? await r.get(debitKey) : null;
-      const eventsKey = coworkerId ? `w2g:ledger:${localCycleKey(new Date(), APP_TZ)}:${coworkerId}` : null;
+      const debitHashKey = coworkerId ? `w2g:debits:${today}:${coworkerId}` : null;
+      const debitHash = debitHashKey ? await r.hGetAll(debitHashKey) : null;
+      const eventsKey = coworkerId ? `w2g:events:${today}` : null;
       const eventsSlice = eventsKey ? await r.lRange(eventsKey, 0, 19) : [];
       return res.status(200).json({
         ok: true,
         probe: 'ledger',
-        keys: { sessionKey: macKey, debitKey, eventsKey },
+        keys: { sessionKey: macKey, debitHashKey, eventsKey },
         session: sessionJson ? JSON.parse(sessionJson) : null,
-        debitCount: debitVal ? Number(debitVal) : null,
+        debits: debitHash,
         events: eventsSlice.map(s => { try { return JSON.parse(s); } catch { return s; } })
       });
     } catch (e) {
@@ -189,7 +191,7 @@ export default async function handler(req, res) {
     dbgProbe
   });
 
-  // load time windows
+  // load time windows/planner (this encodes the Early / Session / Extended windows and marketed vs backend times)
   let planBasicSession;
   try {
     const tw = await import('../lib/timeWindows.js');
@@ -201,20 +203,29 @@ export default async function handler(req, res) {
     return res.status(500).json({ ok: false, error: 'Server config error: timeWindows' });
   }
 
-  // redis
+  // redis connect
   let redis;
   try {
     const { getRedis } = await import('../lib/redis.js');
     log('Redis ping start');
     redis = await getRedis();
-    await redis.set(`w2g:auth-ping:${clientMacRaw || 'unknown'}`, JSON.stringify({ when: new Date().toISOString(), site: siteName, siteId }), { EX: 300 });
+    await redis.set(
+      `w2g:auth-ping:${clientMacRaw || 'unknown'}`,
+      JSON.stringify({ when: new Date().toISOString(), site: siteName, siteId }),
+      { EX: 300 }
+    );
   } catch (e) {
-    console.error(`[authorize][${rid}] Redis connect error`, e?.message || e);
+    err('Redis connect error', e?.message || e);
     return res.status(502).json({ ok: false, error: 'Redis unavailable' });
   }
 
   // Nexudus http
-  const nx = axios.create({ baseURL: NEXUDUS_BASE?.replace(/\/+$/, ''), timeout: 15000, headers: { Accept: 'application/json', Authorization: NEX_AUTH || '' }, validateStatus: () => true });
+  const nx = axios.create({
+    baseURL: NEXUDUS_BASE?.replace(/\/+$/, ''),
+    timeout: 15000,
+    headers: { Accept: 'application/json', Authorization: NEX_AUTH || '' },
+    validateStatus: () => true
+  });
 
   async function nxGetCoworkerByEmail(emailAddr) {
     const url = `/api/spaces/coworkers?Coworker_email=${encodeURIComponent(emailAddr)}&_take=1`;
@@ -244,7 +255,10 @@ export default async function handler(req, res) {
     return `${y}-${m}-${d}`;
   }
   function creditKeys(cycleKey, coworkerId) {
-    return { ledgerKey: `w2g:credits:${cycleKey}:${coworkerId}`, eventsKey: `w2g:ledger:${cycleKey}:${coworkerId}` };
+    return {
+      ledgerKey: `w2g:credits:${cycleKey}:${coworkerId}`,
+      eventsKey: `w2g:ledger:${cycleKey}:${coworkerId}`
+    };
   }
   async function getOrInitLedger(r, ledgerKey, seed) {
     const existing = await r.get(ledgerKey);
@@ -252,27 +266,36 @@ export default async function handler(req, res) {
     await r.set(ledgerKey, JSON.stringify(seed));
     return seed;
   }
-  function centsForCharge(code) {
-    if (code === 'daily') return toInt(BASIC_SESSION_CENTS, 500);
-    if (code === 'after_hours') return toInt(BASIC_EXTEND_CENTS, 500);
-    if (code === 'early') return toInt(BASIC_SESSION_CENTS, 500);
+
+  // Map planner charge codes to per-day hash fields and amounts
+  function amountForCharge(code) {
+    if (code === 'daily')       return toInt(BASIC_SESSION_CENTS, 500);   // normal window
+    if (code === 'after_hours') return toInt(BASIC_EXTEND_CENTS, 500);    // extended window
+    if (code === 'early')       return toInt(BASIC_EARLY_CENTS, 500);     // early window
     return 0;
+  }
+  function fieldForCharge(code) {
+    if (code === 'daily')       return 'session';
+    if (code === 'after_hours') return 'extend';
+    if (code === 'early')       return 'early';
+    return null;
   }
 
   // Nexudus precheck
-  let coworker, hasBasic = false, hasClassic = false, has247 = false;
+  let coworker, hasBasic = false, hasStandard = false, hasPremium = false;
   try {
     coworker = await nxGetCoworkerByEmail(email);
     if (!coworker) return res.status(403).json({ ok: false, error: 'Account not found in Nexudus' });
     log(`Nexudus coworker id=${coworker.Id} name=${coworker.FullName}`);
     const contracts = await nxGetActiveContracts(coworker.Id);
     const names = contracts.map(c => String(c.TariffName || '').trim().toLowerCase());
-    hasBasic = names.some(n => n.includes('basic'));
-    hasClassic = names.some(n => n.includes('classic'));
-    has247 = names.some(n => n.includes('24') || n.includes('247'));
-    log(`Active contracts=${contracts.length} hasBasic=${hasBasic} hasClassic=${hasClassic} has247=${has247}`);
+    // Plan name mapping: Classic → Standard, 24/7 → Premium (back end still reads what's in Nexudus today)
+    hasBasic   = names.some(n => n.includes('basic'));
+    hasStandard= names.some(n => n.includes('classic') || n.includes('standard'));
+    hasPremium = names.some(n => n.includes('24') || n.includes('247') || n.includes('premium'));
+    log(`Active contracts=${contracts.length} hasBasic=${hasBasic} hasStandard=${hasStandard} hasPremium=${hasPremium}`);
 
-    if ((ssidName || '').toLowerCase().includes('basic') && !hasBasic && !hasClassic && !has247) {
+    if ((ssidName || '').toLowerCase().includes('basic') && !hasBasic && !hasStandard && !hasPremium) {
       return res.status(403).json({ ok: false, error: 'Basic plan required for this SSID' });
     }
   } catch (e) {
@@ -283,6 +306,7 @@ export default async function handler(req, res) {
   const isBasic = hasBasic;
   let plan;
   try {
+    // planBasicSession encodes the 7:30/8:50/4:10/5:30 windows and whether extend was confirmed
     const mod = await import('../lib/timeWindows.js');
     const fn = (mod.default && mod.default.planBasicSession) ? mod.default.planBasicSession : mod.planBasicSession;
     plan = isBasic
@@ -295,31 +319,25 @@ export default async function handler(req, res) {
     err('Time planner error:', e?.message || e);
     return res.status(500).json({ ok: false, error: 'Time planner failed' });
   }
-  const totalRequiredCents = (plan.charges || []).reduce((sum, ch) => sum + centsForCharge(ch.code), 0);
 
-  if (dbgProbe === 'nexudus') {
-    log('Probe mode nexudus short circuit before Omada calls');
-    return res.status(200).json({
-      ok: true,
-      probe: 'nexudus',
-      coworkerId: coworker.Id,
-      fullName: coworker.FullName,
-      plans: { basic: hasBasic, classic: hasClassic, p247: has247 },
-      window: plan.window,
-      durationMs: plan.durationMs,
-      charges: plan.charges,
-      requiredCents: totalRequiredCents,
-      siteId,
-      siteName
-    });
-  }
-
-  // credits preview and event seed
+  // Credit preview against monthly pool
+  let cycleKey, ledgerKey, eventsKey, ledger;
   try {
-    const cycleKey = localCycleKey(new Date(), APP_TZ);
-    const { ledgerKey, eventsKey } = creditKeys(cycleKey, coworker.Id);
-    const seed = { coworkerId: coworker.Id, email, plan: isBasic ? 'basic' : (hasClassic ? 'classic' : (has247 ? '247' : 'other')), cycle: cycleKey, remainingCents: Number(BASIC_MONTHLY_CENTS), spentCents: 0, checkins: 0, lastUpdated: new Date().toISOString() };
-    const ledger = await getOrInitLedger(redis, ledgerKey, seed);
+    cycleKey = localCycleKey(new Date(), APP_TZ);
+    ({ ledgerKey, eventsKey } = creditKeys(cycleKey, coworker.Id));
+    const seed = {
+      coworkerId: coworker.Id,
+      email,
+      plan: isBasic ? 'basic' : (hasStandard ? 'standard' : (hasPremium ? 'premium' : 'other')),
+      cycle: cycleKey,
+      remainingCents: Number(BASIC_MONTHLY_CENTS),
+      spentCents: 0,
+      checkins: 0,
+      lastUpdated: new Date().toISOString()
+    };
+    ledger = await getOrInitLedger(redis, ledgerKey, seed);
+
+    // Bump pool up to current BASIC_MONTHLY_CENTS if this is a new month or smaller cap
     const currentCap = Number(ledger.remainingCents || 0) + Number(ledger.spentCents || 0);
     if (currentCap < Number(BASIC_MONTHLY_CENTS)) {
       const bump = Number(BASIC_MONTHLY_CENTS) - currentCap;
@@ -327,15 +345,93 @@ export default async function handler(req, res) {
       ledger.lastUpdated = new Date().toISOString();
       await redis.set(ledgerKey, JSON.stringify(ledger));
     }
-    if (isBasic && Number(ledger.remainingCents) < totalRequiredCents) {
+
+    // Sum required for this attempt
+    const required = (plan.charges || []).reduce((sum, ch) => sum + amountForCharge(ch.code), 0);
+    if (isBasic && Number(ledger.remainingCents) < required) {
       return res.status(402).json({ ok: false, error: 'Not enough credits for WiFi session' });
     }
-    await redis.lPush(eventsKey, JSON.stringify({ when: new Date().toISOString(), type: 'preauth', clientMac: macToColons(clientMacRaw), apMac: macToColons(apMacRaw), ssidName, site: siteName, siteId, preview: true }));
+
+    // Preauth event
+    await redis.lPush(eventsKey, JSON.stringify({
+      when: new Date().toISOString(),
+      type: 'preauth',
+      clientMac: macToColons(clientMacRaw),
+      apMac: macToColons(apMacRaw),
+      ssidName,
+      site: siteName,
+      siteId,
+      preview: true,
+      charges: plan.charges || []
+    }));
   } catch (e) {
     err('Ledger preview error', e?.message || e);
   }
 
-  // controller login and auth
+  // ---------- APPLY PER-DAY DEDUCTIONS (idempotent by coworkerId + date + type) ----------
+  const todayKey = localDateKey(new Date(), APP_TZ);
+  const debitHashKey = `w2g:debits:${todayKey}:${coworker.Id}`;
+  let took = [];   // which fields were newly recorded today
+  let skip = [];   // which fields already existed
+
+  if (isBasic && Array.isArray(plan.charges) && plan.charges.length) {
+    try {
+      const existing = await redis.hGetAll(debitHashKey); // { early: "500", session: "500", extend: "500" } or {}
+      for (const ch of plan.charges) {
+        const field = fieldForCharge(ch.code);
+        const amount = amountForCharge(ch.code);
+        if (!field || !amount) continue;
+
+        if (existing && Object.prototype.hasOwnProperty.call(existing, field)) {
+          skip.push(field);
+          continue;
+        }
+
+        // Write hash field and expire; use HEXISTS + HSET to be compatible across Redis providers
+        const already = await redis.hExists(debitHashKey, field);
+        if (!already) {
+          await redis.hSet(debitHashKey, field, String(amount));
+          // keep daily hash for 60 days
+          await redis.expire(debitHashKey, 60 * 24 * 60 * 60);
+          took.push(field);
+
+          // Apply to monthly ledger atomically enough for our needs
+          // read-modify-write (race is acceptable for single user pace)
+          try {
+            const cur = JSON.parse((await redis.get(ledgerKey)) || JSON.stringify(ledger));
+            cur.remainingCents = Math.max(0, Number(cur.remainingCents || 0) - amount);
+            cur.spentCents = Number(cur.spentCents || 0) + amount;
+            cur.checkins = Number(cur.checkins || 0) + (field === 'session' ? 1 : 0);
+            cur.lastUpdated = new Date().toISOString();
+            await redis.set(ledgerKey, JSON.stringify(cur));
+            ledger = cur;
+          } catch (e) {
+            err('Monthly ledger apply error', e?.message || e);
+          }
+
+          // Event log
+          await redis.lPush(`w2g:events:${todayKey}`, JSON.stringify({
+            when: new Date().toISOString(),
+            type: `basic-allow:${field}`,
+            coworkerId: coworker.Id,
+            email,
+            clientMac: macToColons(clientMacRaw),
+            ssidName,
+            amountCents: amount
+          }));
+        } else {
+          skip.push(field);
+        }
+      }
+    } catch (e) {
+      err('Debit apply error', e?.message || e);
+      // fail closed for safety if planner required a deduction we cannot record
+      return res.status(500).json({ ok: false, error: 'Credit ledger error' });
+    }
+  }
+  // -------------------------------------------------------------------
+
+  // controller login and auth to Omada
   function makeClient(purpose) {
     const agent = new https.Agent({ rejectUnauthorized: false, keepAlive: false, maxSockets: 1 });
     const headers = {
@@ -394,7 +490,9 @@ export default async function handler(req, res) {
     return { data: resp.data, status: resp.status };
   };
 
+  // Session duration from planner
   const timeMsBase = Math.max(60000, Number((await import('../lib/timeWindows.js')).planBasicSession ? plan.durationMs : 60000) || 60000);
+
   const macFormats = [
     { label: 'colons',     cm: macToColons(clientMacRaw), am: macToColons(apMacRaw) },
     { label: 'hyphens',    cm: macToHyphens(clientMacRaw), am: macToHyphens(apMacRaw) },
@@ -436,26 +534,43 @@ export default async function handler(req, res) {
   // success write backs
   const nowIso = new Date().toISOString();
   const dateKey = localDateKey(new Date(), APP_TZ);
+
   try {
     await redis.set(
       `w2g:session:${macPlainLower(clientMacRaw)}`,
-      JSON.stringify({ when: nowIso, coworkerId: coworker.Id, email, ssidName, siteId, siteName, cutoff: new Date(Date.now() + (plan.durationMs || 60000)).toISOString(), window: plan.window }),
+      JSON.stringify({
+        when: nowIso,
+        coworkerId: coworker.Id,
+        email,
+        ssidName,
+        siteId,
+        siteName,
+        cutoff: new Date(Date.now() + (plan.durationMs || 60000)).toISOString(),
+        window: plan.window
+      }),
       { EX: 6 * 3600 }
     );
   } catch (e) {
     err('Session write error', e?.message || e);
   }
+
   try {
-    await redis.lPush(`w2g:events:${dateKey}`, JSON.stringify({ when: nowIso, type: 'authorize', coworkerId: coworker.Id, email, clientMac: macToColons(clientMacRaw), apMac: macToColons(apMacRaw), ssidName, site: siteName, siteId, window: plan.window }));
+    await redis.lPush(`w2g:events:${dateKey}`, JSON.stringify({
+      when: nowIso,
+      type: 'authorize',
+      coworkerId: coworker.Id,
+      email,
+      clientMac: macToColons(clientMacRaw),
+      apMac: macToColons(apMacRaw),
+      ssidName,
+      site: siteName,
+      siteId,
+      window: plan.window,
+      debitsApplied: took,
+      debitsSkipped: skip
+    }));
   } catch (e) {
     err('Events write error', e?.message || e);
-  }
-  try {
-    if (isBasic) {
-      await redis.incr(`w2g:debits:${dateKey}:${coworker.Id}`);
-    }
-  } catch (e) {
-    err('Debit counter error', e?.message || e);
   }
 
   const includeDebug = dbg.enabled ? {
@@ -471,7 +586,9 @@ export default async function handler(req, res) {
     cutoff: new Date(Date.now() + (plan.durationMs || 60000)).toISOString(),
     extended: !!extend,
     window: plan.window,
-    message: plan.reason,
+    debitsApplied: took,
+    debitsSkipped: skip,
+    message: plan.reason, // friendly string from planner for splash
     ...includeDebug
   });
 }
