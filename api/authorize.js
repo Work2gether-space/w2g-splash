@@ -1,7 +1,7 @@
 // api/authorize.js  Vercel Node runtime, ESM style
-// Build: 2025-08-26f  step 3.5B — credit enforcement + auto-migrate daily debit key + tolerant probe
+// Build: 2025-08-27a  step 3.5 hardening — Omada login fallback + return debug on failure
 
-console.log("DEBUG: authorize.js build version 2025-08-26f");
+console.log("DEBUG: authorize.js build version 2025-08-27a");
 
 export default async function handler(req, res) {
   const rid = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
@@ -93,12 +93,26 @@ export default async function handler(req, res) {
   const macPlain = mac => macHex(mac);
   const macPlainLower = mac => macPlain(mac).toLowerCase();
 
-  function localCycleKey(date = new Date(), tz = 'America/New_York') {
+  function toInt(v, d) { const n = Number(v); return Number.isFinite(n) ? Math.round(n) : d; }
+  function amountForCharge(code) {
+    if (code === 'daily')       return toInt(BASIC_SESSION_CENTS, 500);
+    if (code === 'after_hours') return toInt(BASIC_EXTEND_CENTS, 500);
+    if (code === 'early')       return toInt(BASIC_EARLY_CENTS, 500);
+    return 0;
+  }
+  function fieldForCharge(code) {
+    if (code === 'daily')       return 'session';
+    if (code === 'after_hours') return 'extend';
+    if (code === 'early')       return 'early';
+    return null;
+  }
+
+  function localCycleKey(date = new Date(), tz = APP_TZ) {
     const yFmt = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric' });
     const mFmt = new Intl.DateTimeFormat('en-CA', { timeZone: tz, month: '2-digit' });
     return `${yFmt.format(date)}-${mFmt.format(date)}`;
   }
-  function localDateKey(date = new Date(), tz = 'America/New_York') {
+  function localDateKey(date = new Date(), tz = APP_TZ) {
     const y = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric' }).format(date);
     const m = new Intl.DateTimeFormat('en-CA', { timeZone: tz, month: '2-digit' }).format(date);
     const d = new Intl.DateTimeFormat('en-CA', { timeZone: tz, day: '2-digit' }).format(date);
@@ -137,7 +151,7 @@ export default async function handler(req, res) {
     }
   }
 
-  // ---------- PROBE: LEDGER (tolerant) ----------
+  // ---------- PROBE: LEDGER ----------
   if (dbgProbe === 'ledger') {
     if (!clientMacRaw) return res.status(400).json({ ok:false, error:'Missing clientMac for ledger probe' });
     try {
@@ -152,7 +166,7 @@ export default async function handler(req, res) {
 
       let debits = null, legacyCounter = null, keyType = null;
       if (debitKey) {
-        keyType = await r.sendCommand(['TYPE', debitKey]); // 'hash', 'string', 'none', etc.
+        keyType = await r.sendCommand(['TYPE', debitKey]);
         if (keyType === 'hash') {
           debits = await r.hGetAll(debitKey);
         } else if (keyType === 'string') {
@@ -250,18 +264,17 @@ export default async function handler(req, res) {
     return Array.isArray(r.data?.Records) ? r.data.Records : [];
   }
 
-  function toInt(v, d) { const n = Number(v); return Number.isFinite(n) ? Math.round(n) : d; }
-  function amountForCharge(code) {
-    if (code === 'daily')       return toInt(BASIC_SESSION_CENTS, 500);
-    if (code === 'after_hours') return toInt(BASIC_EXTEND_CENTS, 500);
-    if (code === 'early')       return toInt(BASIC_EARLY_CENTS, 500);
-    return 0;
+  function creditKeys(cycleKey, coworkerId) {
+    return {
+      ledgerKey: `w2g:credits:${cycleKey}:${coworkerId}`,
+      eventsKey: `w2g:ledger:${cycleKey}:${coworkerId}`
+    };
   }
-  function fieldForCharge(code) {
-    if (code === 'daily')       return 'session';
-    if (code === 'after_hours') return 'extend';
-    if (code === 'early')       return 'early';
-    return null;
+  async function getOrInitLedger(r, ledgerKey, seed) {
+    const existing = await r.get(ledgerKey);
+    if (existing) { try { return JSON.parse(existing); } catch {} }
+    await r.set(ledgerKey, JSON.stringify(seed));
+    return seed;
   }
 
   // Nexudus precheck
@@ -303,36 +316,16 @@ export default async function handler(req, res) {
     return res.status(500).json({ ok: false, error: 'Time planner failed' });
   }
 
-  // Monthly ledger
-  function creditKeys(cycleKey, coworkerId) {
-    return {
-      ledgerKey: `w2g:credits:${cycleKey}:${coworkerId}`,
-      eventsKey: `w2g:ledger:${cycleKey}:${coworkerId}`
-    };
-  }
-  async function getOrInitLedger(r, ledgerKey, seed) {
-    const existing = await r.get(ledgerKey);
-    if (existing) { try { return JSON.parse(existing); } catch {} }
-    await r.set(ledgerKey, JSON.stringify(seed));
-    return seed;
-  }
-
-  let cycleKey, ledgerKey, eventsKey, ledger;
+  // Monthly ledger preview
   try {
-    cycleKey = localCycleKey(new Date(), APP_TZ);
-    ({ ledgerKey, eventsKey } = creditKeys(cycleKey, coworker.Id));
+    const cycleKey = localCycleKey(new Date(), APP_TZ);
+    const { ledgerKey, eventsKey } = creditKeys(cycleKey, coworker.Id);
     const seed = {
-      coworkerId: coworker.Id,
-      email,
+      coworkerId: coworker.Id, email,
       plan: isBasic ? 'basic' : (hasStandard ? 'standard' : (hasPremium ? 'premium' : 'other')),
-      cycle: cycleKey,
-      remainingCents: Number(BASIC_MONTHLY_CENTS),
-      spentCents: 0,
-      checkins: 0,
-      lastUpdated: new Date().toISOString()
+      cycle: cycleKey, remainingCents: Number(BASIC_MONTHLY_CENTS), spentCents: 0, checkins: 0, lastUpdated: new Date().toISOString()
     };
-    ledger = await getOrInitLedger(redis, ledgerKey, seed);
-
+    const ledger = await getOrInitLedger(redis, ledgerKey, seed);
     const currentCap = Number(ledger.remainingCents || 0) + Number(ledger.spentCents || 0);
     if (currentCap < Number(BASIC_MONTHLY_CENTS)) {
       const bump = Number(BASIC_MONTHLY_CENTS) - currentCap;
@@ -340,12 +333,10 @@ export default async function handler(req, res) {
       ledger.lastUpdated = new Date().toISOString();
       await redis.set(ledgerKey, JSON.stringify(ledger));
     }
-
     const required = (plan.charges || []).reduce((sum, ch) => sum + amountForCharge(ch.code), 0);
     if (isBasic && Number(ledger.remainingCents) < required) {
       return res.status(402).json({ ok: false, error: 'Not enough credits for WiFi session' });
     }
-
     await redis.lPush(eventsKey, JSON.stringify({
       when: new Date().toISOString(),
       type: 'preauth',
@@ -361,23 +352,15 @@ export default async function handler(req, res) {
     err('Ledger preview error', e?.message || e);
   }
 
-  // ---------- APPLY PER-DAY DEDUCTIONS with auto-migrate ----------
+  // ---------- APPLY PER-DAY DEDUCTIONS (hash, with auto-migrate) ----------
   const todayKey = localDateKey(new Date(), APP_TZ);
   const debitHashKey = `w2g:debits:${todayKey}:${coworker.Id}`;
-
-  // If legacy string exists from step 3.4c, delete it so we can write a hash
   try {
-    const t = await redis.sendCommand(['TYPE', debitHashKey]); // 'hash' | 'string' | 'none'
-    if (t && t !== 'hash' && t !== 'none') {
-      await redis.del(debitHashKey);
-    }
-  } catch (e) {
-    err('Type check/migrate error', e?.message || e);
-  }
+    const t = await redis.sendCommand(['TYPE', debitHashKey]);
+    if (t && t !== 'hash' && t !== 'none') await redis.del(debitHashKey);
+  } catch (e) { err('Type check/migrate error', e?.message || e); }
 
-  let took = [];
-  let skip = [];
-
+  let took = [], skip = [];
   if (isBasic && Array.isArray(plan.charges) && plan.charges.length) {
     try {
       const existing = await redis.hGetAll(debitHashKey);
@@ -385,11 +368,9 @@ export default async function handler(req, res) {
         const field = fieldForCharge(ch.code);
         const amount = amountForCharge(ch.code);
         if (!field || !amount) continue;
-
         const already = existing && Object.prototype.hasOwnProperty.call(existing, field)
           ? true
           : await redis.hExists(debitHashKey, field);
-
         if (already) { skip.push(field); continue; }
 
         await redis.hSet(debitHashKey, field, String(amount));
@@ -397,13 +378,14 @@ export default async function handler(req, res) {
         took.push(field);
 
         try {
-          const cur = JSON.parse((await redis.get(ledgerKey)) || JSON.stringify(ledger));
+          const cycleKey = localCycleKey(new Date(), APP_TZ);
+          const ledgerKey = `w2g:credits:${cycleKey}:${coworker.Id}`;
+          const cur = JSON.parse((await redis.get(ledgerKey)) || '{}');
           cur.remainingCents = Math.max(0, Number(cur.remainingCents || 0) - amount);
           cur.spentCents = Number(cur.spentCents || 0) + amount;
           cur.checkins = Number(cur.checkins || 0) + (field === 'session' ? 1 : 0);
           cur.lastUpdated = new Date().toISOString();
           await redis.set(ledgerKey, JSON.stringify(cur));
-          ledger = cur;
         } catch (e) { err('Monthly ledger apply error', e?.message || e); }
 
         await redis.lPush(`w2g:events:${todayKey}`, JSON.stringify({
@@ -423,26 +405,54 @@ export default async function handler(req, res) {
   }
   // -------------------------------------------------------------------
 
-  // Omada login/auth
-  async function controllerLogin() {
-    const makeClient = (purpose) => {
-      const agent = new https.Agent({ rejectUnauthorized: false, keepAlive: false, maxSockets: 1 });
-      const headers = {
-        Accept: 'application/json,text/html;q=0.9,*/*;q=0.1',
-        'User-Agent': `w2g-splash-${purpose}/${Math.random().toString(36).slice(2,7)}`,
-        Connection: 'close',
-        'Cache-Control': 'no-cache',
-        Pragma: 'no-cache',
-        'Accept-Language': 'en-US,en;q=0.9'
-      };
-      if (purpose === 'login') { headers['Origin'] = base; headers['Referer'] = PORTAL_URL; }
-      return axios.create({ timeout: 15000, httpsAgent: agent, headers, validateStatus: () => true, maxRedirects: 0 });
+  // ----------------- Omada login/auth with fallbacks -----------------
+  function makeClient(purpose) {
+    const agent = new https.Agent({ rejectUnauthorized: false, keepAlive: false, maxSockets: 1 });
+    const headers = {
+      Accept: 'application/json,text/html;q=0.9,*/*;q=0.1',
+      'User-Agent': `w2g-splash-${purpose}/${Math.random().toString(36).slice(2,7)}`,
+      Connection: 'close',
+      'Cache-Control': 'no-cache',
+      Pragma: 'no-cache',
+      'Accept-Language': 'en-US,en;q=0.9'
     };
+    if (purpose === 'login') { headers['Origin'] = base; headers['Referer'] = PORTAL_URL; }
+    return axios.create({ timeout: 15000, httpsAgent: agent, headers, validateStatus: () => true, maxRedirects: 0 });
+  }
+
+  function extractTokenFromHeaders(setCookieArr = [], headers = {}) {
+    // Look for csrf-like pieces in cookies
+    const sc = (setCookieArr || []).map(String);
+    const join = sc.join('; ');
+    const m =
+      join.match(/csrf[-_]?token=([^;]+)/i) ||
+      join.match(/x[-_]?csrf[-_]?token=([^;]+)/i) ||
+      join.match(/portal[-_]?csrf=([^;]+)/i);
+    if (m) return m[1];
+    // Some controllers echo token into headers with inconsistent casing
+    const hdr = Object.fromEntries(Object.entries(headers || {}).map(([k, v]) => [k.toLowerCase(), v]));
+    return hdr['csrf-token'] || hdr['x-csrf-token'] || null;
+  }
+
+  async function extractTokenFromPortalHTML() {
+    try {
+      const resp = await makeClient('warmup2').get(PORTAL_URL);
+      const html = String(resp.data || '');
+      // Try common patterns: <meta name="csrf-token" content="..."> or window.csrfToken="..."
+      let m = html.match(/name=["']csrf-token["'][^>]*content=["']([^"']+)["']/i);
+      if (m) return m[1];
+      m = html.match(/window\.\w*csrf\w*=["']([^"']+)["']/i);
+      if (m) return m[1];
+      return null;
+    } catch { return null; }
+  }
+
+  async function controllerLogin() {
     const warm = await makeClient('warmup').get(PORTAL_URL);
     const warmCookies = warm.headers?.['set-cookie'] || [];
     const cookieHeader = warmCookies.length ? { Cookie: warmCookies.map(c => String(c).split(';')[0]).join('; ') } : {};
 
-    let loginStatus = null, token = null, setCookie = warmCookies;
+    let loginStatus = null, token = null, setCookie = warmCookies, rawHeaders = {};
     for (const loginUrl of [LOGIN_URL_STD, LOGIN_URL_ALT]) {
       const resp = await makeClient('login').post(
         loginUrl,
@@ -450,16 +460,46 @@ export default async function handler(req, res) {
         { headers: { 'Content-Type': 'application/json', ...cookieHeader } }
       );
       loginStatus = resp.status;
-      const hdrs = resp.headers || {};
-      token = hdrs['csrf-token'] || hdrs['Csrf-Token'] || resp.data?.result?.token || null;
+      rawHeaders = resp.headers || {};
+      token =
+        rawHeaders['csrf-token'] ||
+        rawHeaders['Csrf-Token'] ||
+        (resp.data && resp.data.result && resp.data.result.token) ||
+        null;
+
+      if (!token) {
+        // Fallback 1: try pull from cookies/headers
+        const fromCookies = extractTokenFromHeaders(resp.headers?.['set-cookie'], rawHeaders);
+        if (fromCookies) token = fromCookies;
+      }
+
+      if (!token) {
+        // Fallback 2: scrape portal html for a token
+        const fromHtml = await extractTokenFromPortalHTML();
+        if (fromHtml) token = fromHtml;
+      }
+
       if (token) { setCookie = resp.headers?.['set-cookie'] || setCookie; break; }
     }
-    return { token, setCookie, status: loginStatus };
+    return { token, setCookie, status: loginStatus, rawHeaders };
   }
 
   const loginState = await controllerLogin();
   if (!loginState || !loginState.token) {
-    return res.status(502).json({ ok: false, error: 'Hotspot login failed', detail: 'controller login did not produce token' });
+    // Return debug context even on failure so we can see what Omada sent
+    return res.status(502).json({
+      ok: false,
+      error: 'Hotspot login failed',
+      detail: 'controller login did not produce token',
+      omada: {
+        login: {
+          status: loginState?.status ?? null,
+          tokenPresent: !!loginState?.token,
+          cookies: Array.isArray(loginState?.setCookie) ? loginState.setCookie.length : null,
+          headerKeys: loginState?.rawHeaders ? Object.keys(loginState.rawHeaders) : null
+        }
+      }
+    });
   }
 
   const csrf = loginState.token;
@@ -517,7 +557,16 @@ export default async function handler(req, res) {
 
   if (!authOk) {
     err('AUTH failed after matrix, last=', last.note, 'status', last.status, 'detail:', JSON.stringify(last.data || {}));
-    return res.status(502).json({ ok: false, error: 'Authorization failed', detail: last.data, attempt: last.note, attempts: authAttempts });
+    return res.status(502).json({
+      ok: false,
+      error: 'Authorization failed',
+      detail: last.data,
+      attempt: last.note,
+      attempts: authAttempts,
+      omada: {
+        login: { status: loginState?.status || null, tokenPresent: !!loginState?.token, cookies: (loginState?.setCookie || []).length }
+      }
+    });
   }
 
   const nowIso = new Date().toISOString();
