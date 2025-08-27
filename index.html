@@ -28,6 +28,8 @@
     .hint { font-size: .85rem; color: #333; }
     label[for="extend"].disabled { color: #999; }
     @media (max-height: 560px) { body { align-items: flex-start; padding-top: 2rem; } }
+    details.debug { text-align: left; margin-top: 8px; }
+    details.debug pre { white-space: pre-wrap; word-break: break-word; font-size: 12px; background: #fafafa; border: 1px solid #eee; padding: 8px; border-radius: 6px; }
   </style>
 </head>
 <body>
@@ -59,6 +61,13 @@
 
       <button id="submitBtn" type="submit">Continue</button>
       <div class="error" id="error" role="alert" aria-live="polite"></div>
+
+      <!-- Optional debug viewer (only shows when ?debug=...) -->
+      <details id="debugDetails" class="debug" style="display:none;">
+        <summary>Debug</summary>
+        <pre id="debugOut"></pre>
+      </details>
+
       <div class="note">Need help? Ask the community manager at the front desk.</div>
     </form>
   </div>
@@ -69,7 +78,7 @@
     const HARD_DENY_EARLY_MIN = 7 * 60 + 30; // 7:30 a.m. hard deny before this for Basic
     const EARLY_END_MIN       = 8 * 60 + 50; // 8:50 a.m. end of early slip window
     const DAY_END_MIN         = 16 * 60 + 10; // 4:10 p.m. end of normal window
-    const HARD_CUTOFF_MIN     = 17 * 60 + 30; // 5:30 p.m. hard cutoff (aligned to policy)
+    const HARD_CUTOFF_MIN     = 17 * 60 + 30; // 5:30 p.m. hard cutoff
 
     function etNowMinutes() {
       const fmt = new Intl.DateTimeFormat("en-US", { timeZone: ET_TZ, hour12: false, hour: "2-digit", minute: "2-digit" });
@@ -84,70 +93,29 @@
       const d = new Date();
       const ymd = new Intl.DateTimeFormat("en-CA", { timeZone: ET_TZ, year: "numeric", month: "2-digit", day: "2-digit" }).format(d);
       const hh = String(h).padStart(2, "0"), mm = String(m).padStart(2, "0");
-      // Localize to ET nicely, e.g. "4:10 PM"
       return new Date(`${ymd}T${hh}:${mm}:00`).toLocaleTimeString([], { hour: "numeric", minute: "2-digit", timeZone: ET_TZ });
     }
 
     function computeDisplayPlan() {
       const nowMin = etNowMinutes();
-
-      // 1) Before 7:30 a.m. — hard deny
       if (nowMin < HARD_DENY_EARLY_MIN) {
-        return {
-          window: "closed-early",
-          message: "Access not available yet",
-          details: "Basic access begins at 9:00 a.m. ET. Standard or Premium is required earlier.",
-          extendEnabled: false,
-          allowSubmit: false
-        };
+        return { window: "closed-early", message: "Access not available yet", details: "Basic access begins at 9:00 a.m. ET. Standard or Premium is required earlier.", extendEnabled: false, allowSubmit: false };
       }
-
-      // 2) 7:30 to 8:50 a.m. — early slip window
       if (nowMin < EARLY_END_MIN) {
         const until = formatEtTime(DAY_END_MIN);
-        return {
-          window: "early",
-          message: "Early access window",
-          details: `Deduction today: 5 credits early + 5 credits day. Session runs until ${until}.`,
-          extendEnabled: false,
-          allowSubmit: true
-        };
+        return { window: "early", message: "Early access window", details: `Deduction today: 5 credits early + 5 credits day. Session runs until ${until}.`, extendEnabled: false, allowSubmit: true };
       }
-
-      // 3) 8:50 a.m. to 4:10 p.m. — normal day window
       if (nowMin < DAY_END_MIN) {
         const until = formatEtTime(DAY_END_MIN);
-        return {
-          window: "day",
-          message: "Day access window",
-          details: `Deduction today: 5 credits day. Session runs until ${until}.`,
-          extendEnabled: false,
-          allowSubmit: true
-        };
+        return { window: "day", message: "Day access window", details: `Deduction today: 5 credits day. Session runs until ${until}.`, extendEnabled: false, allowSubmit: true };
       }
-
-      // 4) 4:10 p.m. to 5:30 p.m. — extended window
       if (nowMin < HARD_CUTOFF_MIN) {
         const toHard = minutesUntil(HARD_CUTOFF_MIN, nowMin);
         const granted = Math.min(60, toHard);
         const endingAt = formatEtTime(nowMin + granted);
-        return {
-          window: "after",
-          message: "Extended window",
-          details: `Deduction today: 5 credits extended. Up to 60 minutes, ending by ${endingAt}. Hard cutoff is 5:30 p.m. ET.`,
-          extendEnabled: true,
-          allowSubmit: true
-        };
+        return { window: "after", message: "Extended window", details: `Deduction today: 5 credits extended. Up to 60 minutes, ending by ${endingAt}. Hard cutoff is 5:30 p.m. ET.`, extendEnabled: true, allowSubmit: true };
       }
-
-      // 5) After 5:30 p.m. — hard cutoff
-      return {
-        window: "closed",
-        message: "Access has ended for today",
-        details: "Basic ends at 4:00 p.m. ET. Extended ends at 5:30 p.m. ET.",
-        extendEnabled: false,
-        allowSubmit: false
-      };
+      return { window: "closed", message: "Access has ended for today", details: "Basic ends at 4:00 p.m. ET. Extended ends at 5:30 p.m. ET.", extendEnabled: false, allowSubmit: false };
     }
 
     // Read Omada query params (with common fallbacks)
@@ -159,12 +127,13 @@
     function normalizeRedirect(url) {
       if (!url) return 'http://neverssl.com';
       try { url = decodeURIComponent(url); } catch {}
-      // Replace well-known probe URLs with a safe target
       if (/captiveportal|connecttest|generate_204|msftconnecttest|wifiportal/i.test(url)) {
         return 'http://neverssl.com';
       }
       return url;
     }
+
+    const debugParam = (get('debug') || '').toLowerCase().trim();
 
     const params = {
       clientMac: first('clientMac', 'client_id'),
@@ -190,13 +159,14 @@
     const extendHint = document.getElementById('extendHint');
     const submitBtn = document.getElementById('submitBtn');
     const errorDiv = document.getElementById('error');
+    const debugDetails = document.getElementById('debugDetails');
+    const debugOut = document.getElementById('debugOut');
 
     function refreshStatus() {
       const plan = computeDisplayPlan();
       statusDiv.style.display = 'block';
       statusDiv.innerHTML = `<strong>${plan.message}</strong><div class="muted">${plan.details}</div>`;
 
-      // Extend gating and hints
       if (plan.extendEnabled) {
         extendBox.disabled = false;
         extendLabel.classList.remove('disabled');
@@ -212,7 +182,6 @@
         }
       }
 
-      // Disable submit if out of policy
       submitBtn.disabled = !plan.allowSubmit;
       if (!plan.allowSubmit) {
         errorDiv.textContent = (plan.window === 'closed-early')
@@ -221,7 +190,6 @@
             ? 'Internet access has ended for today.'
             : '';
       } else {
-        // Do not overwrite server errors from previous attempt
         if (errorDiv.textContent === 'Please connect to the W2G_Basic Wi-Fi and try again.' ||
             errorDiv.textContent === 'Basic access is not available yet. Please reconnect later.' ||
             errorDiv.textContent === 'Internet access has ended for today.') {
@@ -230,7 +198,6 @@
       }
     }
     refreshStatus();
-    // Re-check status every minute in case someone leaves the page open
     setInterval(refreshStatus, 60000);
 
     // If not on the Wi-Fi (missing essentials), disable submit with a friendly hint
@@ -240,7 +207,7 @@
       errorDiv.textContent = 'Please connect to the W2G_Basic Wi-Fi and try again.';
     }
 
-    // Submit handler (server is authoritative; UI is only guidance)
+    // Submit handler
     document.getElementById('loginForm').addEventListener('submit', async (e) => {
       e.preventDefault();
       if (submitBtn.disabled) return;
@@ -248,7 +215,6 @@
       const emailEl = document.getElementById('email');
       const emailVal = emailEl.value.trim();
       errorDiv.textContent = '';
-
       if (!emailVal) {
         errorDiv.textContent = 'Please enter your email.';
         emailEl.focus();
@@ -269,22 +235,29 @@
         extend: extendBox.checked
       };
 
+      const headers = { 'Content-Type': 'application/json' };
+      if (debugParam) headers['X-Debug-Probe'] = debugParam; // <-- forward debug to API
+
       try {
-        const res = await fetch('/api/authorize', {
+        const res = await fetch('/api/authorize' + (debugParam ? `?debug=${encodeURIComponent(debugParam)}` : ''), {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers,
           body: JSON.stringify(payload)
         });
         const txt = await res.text();
         let data = {};
         try { data = JSON.parse(txt); } catch {}
 
+        if (debugParam) {
+          debugDetails.style.display = 'block';
+          debugOut.textContent = JSON.stringify(data, null, 2);
+        }
+
         if (res.ok && data.ok && data.redirectUrl) {
           location.href = data.redirectUrl;
           return;
         }
 
-        // Show server message clearly
         errorDiv.textContent = (data && (data.error || data.message)) ? (data.error || data.message) : 'Authorize failed. Try again.';
       } catch (err) {
         errorDiv.textContent = 'Network error. Try again.';
