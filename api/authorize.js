@@ -1,7 +1,12 @@
-// api/authorize.js  Vercel Node runtime, ESM style
-// Build: 2025-08-27a  step 3.5 hardening — Omada login fallback + return debug on failure
+// api/authorize.js — Vercel Node runtime, ESM
+// Build: 2025-08-28b — Step 3.5 hardening
+// - Uses hotspot operator login at /{CTRL}/api/v2/hotspot/login (with warmup cookies)
+// - Extracts CSRF from payload/headers/cookies/portal html
+// - Authorization matrix with proper headers/cookies
+// - Nexudus precheck + Redis-backed ledger/session/credits
+// - Debug probes: ?debug=redis | ?debug=ledger | ?debug=omada
 
-console.log("DEBUG: authorize.js build version 2025-08-27a");
+console.log("DEBUG: authorize.js build version 2025-08-28b");
 
 export default async function handler(req, res) {
   const rid = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
@@ -16,6 +21,7 @@ export default async function handler(req, res) {
   const https = await import('https');
 
   const {
+    // Omada
     OMADA_BASE,
     OMADA_CONTROLLER_ID,
     OMADA_OPERATOR_USER,
@@ -23,10 +29,12 @@ export default async function handler(req, res) {
     OMADA_SITE_NAME,
     OMADA_SITE_ID,
 
+    // Nexudus
     NEXUDUS_BASE,
     NEXUDUS_USER,
     NEXUDUS_PASS,
 
+    // Policy / time
     APP_TZ = 'America/New_York',
 
     BASIC_MONTHLY_CENTS = '7500',
@@ -45,15 +53,22 @@ export default async function handler(req, res) {
 
   const base = OMADA_BASE.replace(/\/+$/, '');
   const CTRL_ID = OMADA_CONTROLLER_ID;
+  const PORTAL_URL    = `${base}/${CTRL_ID}/portal`;
   const LOGIN_URL_STD = `${base}/${CTRL_ID}/api/v2/hotspot/login`;
   const LOGIN_URL_ALT = `${base}/${CTRL_ID}/api/v2/hotspot/extPortal/login`;
-  const AUTH_URL      = `${base}/${CTRL_ID}/api/v2/hotspot/extPortal/auth`;
-  const PORTAL_URL    = `${base}/${CTRL_ID}/portal`;
 
-  const NEX_AUTH  = (NEXUDUS_USER && NEXUDUS_PASS)
+  // Preferred Omada authorize endpoints (we try them in order)
+  const AUTH_URLS = [
+    `${base}/${CTRL_ID}/api/v2/hotspot/clients/authorize`,
+    `${base}/${CTRL_ID}/api/v2/hotspot/authorize`,
+    `${base}/${CTRL_ID}/api/v2/hotspot/extPortal/auth`
+  ];
+
+  const NEX_AUTH = (NEXUDUS_USER && NEXUDUS_PASS)
     ? "Basic " + Buffer.from(`${NEXUDUS_USER}:${NEXUDUS_PASS}`).toString("base64")
     : null;
 
+  // ---------- input ----------
   const b = (req.body && typeof req.body === 'object') ? req.body : {};
   const clientMacRaw = b.clientMac || b.client_id || '';
   const apMacRaw     = b.apMac || '';
@@ -92,12 +107,12 @@ export default async function handler(req, res) {
   };
   const macPlain = mac => macHex(mac);
   const macPlainLower = mac => macPlain(mac).toLowerCase();
+  const toInt = (v, d) => { const n = Number(v); return Number.isFinite(n) ? Math.round(n) : d; };
 
-  function toInt(v, d) { const n = Number(v); return Number.isFinite(n) ? Math.round(n) : d; }
   function amountForCharge(code) {
     if (code === 'daily')       return toInt(BASIC_SESSION_CENTS, 500);
-    if (code === 'after_hours') return toInt(BASIC_EXTEND_CENTS, 500);
-    if (code === 'early')       return toInt(BASIC_EARLY_CENTS, 500);
+    if (code === 'after_hours') return toInt(BASIC_EXTEND_CENTS,  500);
+    if (code === 'early')       return toInt(BASIC_EARLY_CENTS,   500);
     return 0;
   }
   function fieldForCharge(code) {
@@ -192,9 +207,8 @@ export default async function handler(req, res) {
       return res.status(500).json({ ok:false, probe:'ledger', error:String(e?.message || e) });
     }
   }
-  // -------------------------------------------------------------------
 
-  // request validation
+  // ---------- request validation ----------
   if (!clientMacRaw || !siteId) {
     return res.status(400).json({ ok: false, error: !clientMacRaw ? 'Missing clientMac' : 'Missing Omada site id' });
   }
@@ -213,7 +227,7 @@ export default async function handler(req, res) {
     dbgProbe
   });
 
-  // load planner
+  // ---------- load time planner ----------
   let planBasicSession;
   try {
     const tw = await import('../lib/timeWindows.js');
@@ -225,7 +239,7 @@ export default async function handler(req, res) {
     return res.status(500).json({ ok: false, error: 'Server config error: timeWindows' });
   }
 
-  // redis
+  // ---------- redis ----------
   let redis;
   try {
     const { getRedis } = await import('../lib/redis.js');
@@ -241,7 +255,7 @@ export default async function handler(req, res) {
     return res.status(502).json({ ok: false, error: 'Redis unavailable' });
   }
 
-  // Nexudus http
+  // ---------- Nexudus HTTP ----------
   const nx = axios.create({
     baseURL: NEXUDUS_BASE?.replace(/\/+$/, ''),
     timeout: 15000,
@@ -277,7 +291,7 @@ export default async function handler(req, res) {
     return seed;
   }
 
-  // Nexudus precheck
+  // ---------- Nexudus precheck ----------
   let coworker, hasBasic = false, hasStandard = false, hasPremium = false;
   try {
     coworker = await nxGetCoworkerByEmail(email);
@@ -300,7 +314,7 @@ export default async function handler(req, res) {
 
   const isBasic = hasBasic;
 
-  // planner
+  // ---------- plan ----------
   let plan;
   try {
     const mod = await import('../lib/timeWindows.js');
@@ -316,7 +330,7 @@ export default async function handler(req, res) {
     return res.status(500).json({ ok: false, error: 'Time planner failed' });
   }
 
-  // Monthly ledger preview
+  // ---------- Monthly ledger preview ----------
   try {
     const cycleKey = localCycleKey(new Date(), APP_TZ);
     const { ledgerKey, eventsKey } = creditKeys(cycleKey, coworker.Id);
@@ -352,7 +366,7 @@ export default async function handler(req, res) {
     err('Ledger preview error', e?.message || e);
   }
 
-  // ---------- APPLY PER-DAY DEDUCTIONS (hash, with auto-migrate) ----------
+  // ---------- Per-day deductions (hash with auto-migrate) ----------
   const todayKey = localDateKey(new Date(), APP_TZ);
   const debitHashKey = `w2g:debits:${todayKey}:${coworker.Id}`;
   try {
@@ -368,6 +382,7 @@ export default async function handler(req, res) {
         const field = fieldForCharge(ch.code);
         const amount = amountForCharge(ch.code);
         if (!field || !amount) continue;
+
         const already = existing && Object.prototype.hasOwnProperty.call(existing, field)
           ? true
           : await redis.hExists(debitHashKey, field);
@@ -403,9 +418,8 @@ export default async function handler(req, res) {
       return res.status(500).json({ ok: false, error: 'Credit ledger error' });
     }
   }
-  // -------------------------------------------------------------------
 
-  // ----------------- Omada login/auth with fallbacks -----------------
+  // ===================== Omada login + authorize =====================
   function makeClient(purpose) {
     const agent = new https.Agent({ rejectUnauthorized: false, keepAlive: false, maxSockets: 1 });
     const headers = {
@@ -417,11 +431,11 @@ export default async function handler(req, res) {
       'Accept-Language': 'en-US,en;q=0.9'
     };
     if (purpose === 'login') { headers['Origin'] = base; headers['Referer'] = PORTAL_URL; }
+    if (purpose === 'warmup' || purpose === 'warmup2') { headers['Referer'] = PORTAL_URL; }
     return axios.create({ timeout: 15000, httpsAgent: agent, headers, validateStatus: () => true, maxRedirects: 0 });
   }
 
   function extractTokenFromHeaders(setCookieArr = [], headers = {}) {
-    // Look for csrf-like pieces in cookies
     const sc = (setCookieArr || []).map(String);
     const join = sc.join('; ');
     const m =
@@ -429,7 +443,6 @@ export default async function handler(req, res) {
       join.match(/x[-_]?csrf[-_]?token=([^;]+)/i) ||
       join.match(/portal[-_]?csrf=([^;]+)/i);
     if (m) return m[1];
-    // Some controllers echo token into headers with inconsistent casing
     const hdr = Object.fromEntries(Object.entries(headers || {}).map(([k, v]) => [k.toLowerCase(), v]));
     return hdr['csrf-token'] || hdr['x-csrf-token'] || null;
   }
@@ -438,7 +451,6 @@ export default async function handler(req, res) {
     try {
       const resp = await makeClient('warmup2').get(PORTAL_URL);
       const html = String(resp.data || '');
-      // Try common patterns: <meta name="csrf-token" content="..."> or window.csrfToken="..."
       let m = html.match(/name=["']csrf-token["'][^>]*content=["']([^"']+)["']/i);
       if (m) return m[1];
       m = html.match(/window\.\w*csrf\w*=["']([^"']+)["']/i);
@@ -468,13 +480,10 @@ export default async function handler(req, res) {
         null;
 
       if (!token) {
-        // Fallback 1: try pull from cookies/headers
         const fromCookies = extractTokenFromHeaders(resp.headers?.['set-cookie'], rawHeaders);
         if (fromCookies) token = fromCookies;
       }
-
       if (!token) {
-        // Fallback 2: scrape portal html for a token
         const fromHtml = await extractTokenFromPortalHTML();
         if (fromHtml) token = fromHtml;
       }
@@ -486,7 +495,6 @@ export default async function handler(req, res) {
 
   const loginState = await controllerLogin();
   if (!loginState || !loginState.token) {
-    // Return debug context even on failure so we can see what Omada sent
     return res.status(502).json({
       ok: false,
       error: 'Hotspot login failed',
@@ -504,13 +512,14 @@ export default async function handler(req, res) {
 
   const csrf = loginState.token;
   const loginCookies = loginState.setCookie || [];
+  const cookieString = loginCookies.map(c => String(c).split(';')[0]).join('; ');
   const baseAuthHeaders = {
-    Cookie: loginCookies.map(c => String(c).split(';')[0]).join('; '),
+    Cookie: cookieString,
     'Csrf-Token': csrf,
     'X-Csrf-Token': csrf,
     'X-Requested-With': 'XMLHttpRequest',
     'Origin': base,
-    'Referer': PORTAL_URL,
+    'Referer': `${base}/${CTRL_ID}/hotspot`,
     Accept: 'application/json'
   };
   const httpsAgentAuth = new https.Agent({ rejectUnauthorized: false, keepAlive: false, maxSockets: 1 });
@@ -521,37 +530,67 @@ export default async function handler(req, res) {
     return { data: resp.data, status: resp.status };
   };
 
-  const timeMsBase = Math.max(60000, Number((await import('../lib/timeWindows.js')).planBasicSession ? plan.durationMs : 60000) || 60000);
+  // Build authorization payload variants
+  const durationMin = Math.max(1, Math.round((plan.durationMs || 60000) / 60000));
   const macFormats = [
     { label: 'colons',     cm: macToColons(clientMacRaw), am: macToColons(apMacRaw) },
     { label: 'hyphens',    cm: macToHyphens(clientMacRaw), am: macToHyphens(apMacRaw) },
     { label: 'plain',      cm: macPlain(clientMacRaw), am: macPlain(apMacRaw) },
     { label: 'plainlower', cm: macPlainLower(clientMacRaw), am: macPlainLower(apMacRaw) }
   ];
-  const authTypes = [4, 2];
 
+  // attempt matrix across endpoints + payload shapes
   let authOk = false;
   let last = { status: 0, data: null, note: '' };
   const authAttempts = [];
 
   outer:
-  for (const mf of macFormats) {
-    for (const at of authTypes) {
-      const payload = {
+  for (const url of AUTH_URLS) {
+    for (const mf of macFormats) {
+      // Shape A: legacy extPortal style (time in minutes, siteId key)
+      const payloadA = {
         clientMac: mf.cm,
         apMac: mf.am,
         ssidName,
         ssid: ssidName,
         radioId: Number(radioIdRaw) || 1,
-        site: siteId,
-        time: timeMsBase,
-        authType: at
+        siteId,
+        time: durationMin
       };
-      const { data: authData, status: authStatus } = await postJson(AUTH_URL, payload, baseAuthHeaders);
-      last = { status: authStatus, data: authData, note: `mac=${mf.label} authType=${at}` };
-      authAttempts.push({ status: authStatus, errorCode: authData?.errorCode, note: last.note });
-      if (authStatus === 200 && authData?.errorCode === 0) { authOk = true; break outer; }
-      if (!(authStatus === 200 && authData?.errorCode === -41501)) break;
+      // Shape B: clients/authorize style (duration key)
+      const payloadB = {
+        clientMac: mf.cm,
+        apMac: mf.am,
+        ssidName,
+        ssid: ssidName,
+        radioId: Number(radioIdRaw) || 1,
+        siteId,
+        duration: durationMin
+      };
+      const payloads = [payloadA, payloadB];
+
+      // If extPortal/auth, also try explicit authType variants (2,4)
+      if (url.endsWith('/extPortal/auth')) {
+        for (const at of [4, 2]) {
+          payloads.push({ ...payloadA, authType: at });
+          payloads.push({ ...payloadB, authType: at });
+        }
+      }
+
+      for (const p of payloads) {
+        const urlWithToken = `${url}?token=${encodeURIComponent(csrf)}`;
+        const { data: authData, status: authStatus } = await postJson(urlWithToken, p, baseAuthHeaders);
+        last = { status: authStatus, data: authData, note: `${url.split('/api/')[1]} | mac=${mf.label} | keys=${Object.keys(p).join(',')}` };
+        authAttempts.push({ url: url.split(`/${CTRL_ID}/`)[1], status: authStatus, errorCode: authData?.errorCode, note: last.note });
+
+        if (authStatus === 200 && authData && (authData.errorCode === 0 || authData.msg === 'Success.' || authData.result === true)) {
+          authOk = true;
+          break outer;
+        }
+
+        // -41501 is commonly "already authorized" or similar transient; keep iterating if seen with 200
+        if (authStatus === 200 && authData?.errorCode === -41501) continue;
+      }
     }
   }
 
@@ -569,6 +608,7 @@ export default async function handler(req, res) {
     });
   }
 
+  // ---------- persist session + event ----------
   const nowIso = new Date().toISOString();
   const dateKey = localDateKey(new Date(), APP_TZ);
 
