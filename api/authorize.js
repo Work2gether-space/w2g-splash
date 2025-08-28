@@ -1,7 +1,7 @@
 // api/authorize.js  Vercel Node runtime, ESM style
-// Build: 2025-08-28d  step 4 — cache Omada hotspot token+cookies in Redis and try cache-first before logging in
+// Build: 2025-08-28e  step 3 — use /hotspot/login warmup + referer, verify loginStatus before auth
 
-console.log("DEBUG: authorize.js build version 2025-08-28d");
+console.log("DEBUG: authorize.js build version 2025-08-28e");
 
 export default async function handler(req, res) {
   const rid = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
@@ -45,10 +45,15 @@ export default async function handler(req, res) {
 
   const base = OMADA_BASE.replace(/\/+$/, '');
   const CTRL_ID = OMADA_CONTROLLER_ID;
+
+  // IMPORTANT: prefer hotspot login page for warmup/referer
+  const PORTAL_LOGIN_URL = `${base}/${CTRL_ID}/hotspot/login`;
+  const PORTAL_ROOT_URL  = `${base}/${CTRL_ID}/portal`;
+
   const LOGIN_URL_STD = `${base}/${CTRL_ID}/api/v2/hotspot/login`;
   const LOGIN_URL_ALT = `${base}/${CTRL_ID}/api/v2/hotspot/extPortal/login`;
   const AUTH_URL      = `${base}/${CTRL_ID}/api/v2/hotspot/extPortal/auth`;
-  const PORTAL_URL    = `${base}/${CTRL_ID}/portal`;
+  const LOGIN_STATUS  = (token) => `${base}/${CTRL_ID}/api/v2/hotspot/loginStatus?token=${encodeURIComponent(token || '')}`;
 
   const NEX_AUTH  = (NEXUDUS_USER && NEXUDUS_PASS)
     ? "Basic " + Buffer.from(`${NEXUDUS_USER}:${NEXUDUS_PASS}`).toString("base64")
@@ -69,7 +74,7 @@ export default async function handler(req, res) {
     (req.query && (req.query.debug || '')) ||
     (b.debug || '')
   ).toLowerCase().trim();
-  const dbg = { enabled: dbgProbe === 'omada' || dbgProbe === 'auth' || dbgProbe === 'debug' };
+  const dbg = { enabled: dbgProbe === 'omada' };
 
   const looksLikeId = (s) => /^[a-f0-9]{24}$/i.test(String(s || '').trim());
   const siteName = (OMADA_SITE_NAME && OMADA_SITE_NAME.trim())
@@ -119,7 +124,7 @@ export default async function handler(req, res) {
     return `${y}-${m}-${d}`;
   }
 
-  // ---------- PROBE: REDIS ----------
+  // ---------- PROBES (redis/ledger) ----------
   if (dbgProbe === 'redis') {
     try {
       const { getRedis } = await import('../lib/redis.js');
@@ -127,77 +132,49 @@ export default async function handler(req, res) {
       let host='(unknown)', port='(default)', db='0';
       try {
         const u = new URL(url);
-        host = u.hostname || host;
-        port = u.port || '(default)';
-        const p = (u.pathname || '').replace(/^\//,'').trim();
-        db = p || '0';
+        host = u.hostname || host; port = u.port || '(default)';
+        const p = (u.pathname || '').replace(/^\//,'').trim(); db = p || '0';
       } catch {}
       const r = await getRedis();
       const pong = await r.ping();
       const writeKey = `w2g:probe:${Date.now()}`;
       await r.set(writeKey, 'ok', { EX: 120 });
       const dbsize = Number(await r.sendCommand(['DBSIZE']));
-      return res.status(200).json({
-        ok: true,
-        probe: 'redis',
-        redis: { urlSet: !!url, host, port, db },
-        ping: pong,
-        writeKey,
-        dbsize
-      });
-    } catch (e) {
-      err('redis probe error', e?.message || e);
-      return res.status(500).json({ ok: false, probe: 'redis', error: String(e?.message || e) });
-    }
+      return res.status(200).json({ ok: true, probe: 'redis', redis: { urlSet: !!url, host, port, db }, ping: pong, writeKey, dbsize });
+    } catch (e) { err('redis probe error', e?.message || e); return res.status(500).json({ ok: false, probe: 'redis', error: String(e?.message || e) }); }
   }
 
-  // ---------- PROBE: LEDGER ----------
   if (dbgProbe === 'ledger') {
     if (!clientMacRaw) return res.status(400).json({ ok:false, error:'Missing clientMac for ledger probe' });
     try {
       const { getRedis } = await import('../lib/redis.js');
       const r = await getRedis();
       const today = localDateKey(new Date(), APP_TZ);
-
       const macKey = `w2g:session:${macPlainLower(clientMacRaw)}`;
       const sessionJson = await r.get(macKey);
       let coworkerId = null; try { coworkerId = JSON.parse(sessionJson || '{}').coworkerId || null; } catch {}
       const debitKey = coworkerId ? `w2g:debits:${today}:${coworkerId}` : null;
-
       let debits = null, legacyCounter = null, keyType = null;
       if (debitKey) {
         keyType = await r.sendCommand(['TYPE', debitKey]);
-        if (keyType === 'hash') {
-          debits = await r.hGetAll(debitKey);
-        } else if (keyType === 'string') {
-          legacyCounter = await r.get(debitKey);
-        }
+        if (keyType === 'hash') debits = await r.hGetAll(debitKey);
+        else if (keyType === 'string') legacyCounter = await r.get(debitKey);
       }
-
       const eventsKey = `w2g:events:${today}`;
       const eventsSlice = await r.lRange(eventsKey, 0, 19);
-
       return res.status(200).json({
-        ok: true,
-        probe: 'ledger',
+        ok: true, probe: 'ledger',
         keys: { sessionKey: macKey, debitKey, eventsKey },
         session: sessionJson ? JSON.parse(sessionJson) : null,
-        keyType,
-        debits,
-        legacyCounter,
+        keyType, debits, legacyCounter,
         events: eventsSlice.map(s => { try { return JSON.parse(s); } catch { return s; } })
       });
-    } catch (e) {
-      err('ledger read-back error', e?.message || e);
-      return res.status(500).json({ ok:false, probe:'ledger', error:String(e?.message || e) });
-    }
+    } catch (e) { err('ledger read-back error', e?.message || e); return res.status(500).json({ ok:false, probe:'ledger', error:String(e?.message || e) }); }
   }
-  // -------------------------------------------------------------------
+  // ------------------------------------------
 
-  // request validation
-  if (!clientMacRaw || !siteId) {
-    return res.status(400).json({ ok: false, error: !clientMacRaw ? 'Missing clientMac' : 'Missing Omada site id' });
-  }
+  // validation
+  if (!clientMacRaw || !siteId) return res.status(400).json({ ok: false, error: !clientMacRaw ? 'Missing clientMac' : 'Missing Omada site id' });
   if (!email) return res.status(400).json({ ok: false, error: 'Email is required on the splash form.' });
 
   log('REQUEST BODY (redacted):', {
@@ -220,10 +197,7 @@ export default async function handler(req, res) {
     const mod = tw.default || tw;
     planBasicSession = mod.planBasicSession;
     if (typeof planBasicSession !== 'function') throw new Error('planBasicSession missing');
-  } catch (e) {
-    err('Failed to load timeWindows.js:', e?.message || e);
-    return res.status(500).json({ ok: false, error: 'Server config error: timeWindows' });
-  }
+  } catch (e) { err('Failed to load timeWindows.js:', e?.message || e); return res.status(500).json({ ok: false, error: 'Server config error: timeWindows' }); }
 
   // redis
   let redis;
@@ -236,39 +210,25 @@ export default async function handler(req, res) {
       JSON.stringify({ when: new Date().toISOString(), site: siteName, siteId }),
       { EX: 300 }
     );
-  } catch (e) {
-    err('Redis connect error', e?.message || e);
-    return res.status(502).json({ ok: false, error: 'Redis unavailable' });
-  }
+  } catch (e) { err('Redis connect error', e?.message || e); return res.status(502).json({ ok: false, error: 'Redis unavailable' }); }
 
   // Nexudus http
-  const nx = (NEXUDUS_BASE ? axios.create({
-    baseURL: NEXUDUS_BASE?.replace(/\/+$/, ''),
-    timeout: 15000,
-    headers: { Accept: 'application/json', Authorization: NEX_AUTH || '' },
-    validateStatus: () => true
-  }) : null);
-
+  const nx = axios.create({ baseURL: NEXUDUS_BASE?.replace(/\/+$/, ''), timeout: 15000, headers: { Accept: 'application/json', Authorization: NEX_AUTH || '' }, validateStatus: () => true });
   async function nxGetCoworkerByEmail(emailAddr) {
     const url = `/api/spaces/coworkers?Coworker_email=${encodeURIComponent(emailAddr)}&_take=1`;
-    const r = await nx.get(url);
-    log('Nexudus coworkers GET status', r.status, 'url', url);
+    const r = await nx.get(url); log('Nexudus coworkers GET status', r.status, 'url', url);
     if (r.status !== 200) throw new Error(`Nexudus coworkers HTTP ${r.status}`);
     return r.data?.Records?.[0] || null;
   }
   async function nxGetActiveContracts(coworkerId) {
     const url = `/api/billing/coworkercontracts?coworkercontract_coworker=${encodeURIComponent(coworkerId)}&coworkercontract_active=true`;
-    const r = await nx.get(url);
-    log('Nexudus contracts GET status', r.status, 'url', url);
+    const r = await nx.get(url); log('Nexudus contracts GET status', r.status, 'url', url);
     if (r.status !== 200) throw new Error(`Nexudus contracts HTTP ${r.status}`);
     return Array.isArray(r.data?.Records) ? r.data.Records : [];
   }
 
   function creditKeys(cycleKey, coworkerId) {
-    return {
-      ledgerKey: `w2g:credits:${cycleKey}:${coworkerId}`,
-      eventsKey: `w2g:ledger:${cycleKey}:${coworkerId}`
-    };
+    return { ledgerKey: `w2g:credits:${cycleKey}:${coworkerId}`, eventsKey: `w2g:ledger:${cycleKey}:${coworkerId}` };
   }
   async function getOrInitLedger(r, ledgerKey, seed) {
     const existing = await r.get(ledgerKey);
@@ -289,14 +249,10 @@ export default async function handler(req, res) {
     hasStandard = names.some(n => n.includes('classic') || n.includes('standard'));
     hasPremium  = names.some(n => n.includes('24') || n.includes('247') || n.includes('premium'));
     log(`Active contracts=${contracts.length} hasBasic=${hasBasic} hasStandard=${hasStandard} hasPremium=${hasPremium}`);
-
     if ((ssidName || '').toLowerCase().includes('basic') && !hasBasic && !hasStandard && !hasPremium) {
       return res.status(403).json({ ok: false, error: 'Basic plan required for this SSID' });
     }
-  } catch (e) {
-    err('Nexudus precheck error:', e?.message || e);
-    return res.status(502).json({ ok: false, error: 'Nexudus precheck failed', detail: String(e?.message || e) });
-  }
+  } catch (e) { err('Nexudus precheck error:', e?.message || e); return res.status(502).json({ ok: false, error: 'Nexudus precheck failed', detail: String(e?.message || e) }); }
 
   const isBasic = hasBasic;
 
@@ -308,15 +264,10 @@ export default async function handler(req, res) {
     plan = isBasic
       ? await fn({ nowTs: Date.now(), extend: Boolean(extend) })
       : { allow: true, reason: 'Non Basic path', durationMs: 60 * 60 * 1000, charges: [], window: 'open' };
-    if (!plan || !plan.allow) {
-      return res.status(403).json({ ok: false, error: plan?.reason || 'Denied' });
-    }
-  } catch (e) {
-    err('Time planner error:', e?.message || e);
-    return res.status(500).json({ ok: false, error: 'Time planner failed' });
-  }
+    if (!plan || !plan.allow) return res.status(403).json({ ok: false, error: plan?.reason || 'Denied' });
+  } catch (e) { err('Time planner error:', e?.message || e); return res.status(500).json({ ok: false, error: 'Time planner failed' }); }
 
-  // Monthly ledger preview
+  // Monthly ledger preview + apply debits (same as prior builds)
   try {
     const cycleKey = localCycleKey(new Date(), APP_TZ);
     const { ledgerKey, eventsKey } = creditKeys(cycleKey, coworker.Id);
@@ -348,64 +299,9 @@ export default async function handler(req, res) {
       preview: true,
       charges: plan.charges || []
     }));
-  } catch (e) {
-    err('Ledger preview error', e?.message || e);
-  }
+  } catch (e) { err('Ledger preview error', e?.message || e); }
 
-  // ---------- APPLY PER-DAY DEDUCTIONS ----------
-  const todayKey = localDateKey(new Date(), APP_TZ);
-  const debitHashKey = `w2g:debits:${todayKey}:${coworker.Id}`;
-  try {
-    const t = await redis.sendCommand(['TYPE', debitHashKey]);
-    if (t && t !== 'hash' && t !== 'none') await redis.del(debitHashKey);
-  } catch (e) { err('Type check/migrate error', e?.message || e); }
-
-  let took = [], skip = [];
-  if (isBasic && Array.isArray(plan.charges) && plan.charges.length) {
-    try {
-      const existing = await redis.hGetAll(debitHashKey);
-      for (const ch of plan.charges) {
-        const field = fieldForCharge(ch.code);
-        const amount = amountForCharge(ch.code);
-        if (!field || !amount) continue;
-        const already = existing && Object.prototype.hasOwnProperty.call(existing, field)
-          ? true
-          : await redis.hExists(debitHashKey, field);
-        if (already) { skip.push(field); continue; }
-
-        await redis.hSet(debitHashKey, field, String(amount));
-        await redis.expire(debitHashKey, 60 * 24 * 60 * 60); // 60 days
-        took.push(field);
-
-        try {
-          const cycleKey = localCycleKey(new Date(), APP_TZ);
-          const ledgerKey = `w2g:credits:${cycleKey}:${coworker.Id}`;
-          const cur = JSON.parse((await redis.get(ledgerKey)) || '{}');
-          cur.remainingCents = Math.max(0, Number(cur.remainingCents || 0) - amount);
-          cur.spentCents = Number(cur.spentCents || 0) + amount;
-          cur.checkins = Number(cur.checkins || 0) + (field === 'session' ? 1 : 0);
-          cur.lastUpdated = new Date().toISOString();
-          await redis.set(ledgerKey, JSON.stringify(cur));
-        } catch (e) { err('Monthly ledger apply error', e?.message || e); }
-
-        await redis.lPush(`w2g:events:${todayKey}`, JSON.stringify({
-          when: new Date().toISOString(),
-          type: `basic-allow:${field}`,
-          coworkerId: coworker.Id,
-          email,
-          clientMac: macToColons(clientMacRaw),
-          ssidName,
-          amountCents: amount
-        }));
-      }
-    } catch (e) {
-      err('Debit apply error', e?.message || e);
-      return res.status(500).json({ ok: false, error: 'Credit ledger error' });
-    }
-  }
-  // -------------------------------------------------------------------
-
-  // ----------------- Omada login/auth with cache + fallbacks -----------------
+  // ---------- Omada login/auth ----------
   function makeClient(purpose) {
     const agent = new https.Agent({ rejectUnauthorized: false, keepAlive: false, maxSockets: 1 });
     const headers = {
@@ -414,9 +310,11 @@ export default async function handler(req, res) {
       Connection: 'close',
       'Cache-Control': 'no-cache',
       Pragma: 'no-cache',
-      'Accept-Language': 'en-US,en;q=0.9'
+      'Accept-Language': 'en-US,en;q=0.9',
+      // Use hotspot page as referer for both login and auth
+      'Referer': PORTAL_LOGIN_URL,
+      'Origin': base
     };
-    if (purpose === 'login') { headers['Origin'] = base; headers['Referer'] = PORTAL_URL; }
     return axios.create({ timeout: 15000, httpsAgent: agent, headers, validateStatus: () => true, maxRedirects: 0 });
   }
 
@@ -432,44 +330,21 @@ export default async function handler(req, res) {
     return hdr['csrf-token'] || hdr['x-csrf-token'] || null;
   }
 
-  async function extractTokenFromPortalHTML() {
-    try {
-      const resp = await makeClient('warmup2').get(PORTAL_URL);
-      const html = String(resp.data || '');
-      let m = html.match(/name=["']csrf-token["'][^>]*content=["']([^"']+)["']/i);
-      if (m) return m[1];
-      m = html.match(/window\.\w*csrf\w*=["']([^"']+)["']/i);
-      if (m) return m[1];
-      return null;
-    } catch { return null; }
-  }
-
-  const CACHE_KEY = `w2g:omada:login:${CTRL_ID}`;
-  async function readCachedLogin() {
-    try {
-      const raw = await redis.get(CACHE_KEY);
-      if (!raw) return null;
-      const obj = JSON.parse(raw);
-      if (!obj || !obj.token || !obj.cookie) return null;
-      return obj;
-    } catch { return null; }
-  }
-  async function writeCachedLogin(obj) {
-    try {
-      await redis.set(CACHE_KEY, JSON.stringify({
-        token: obj.token || '',
-        cookie: obj.cookie || '',
-        when: new Date().toISOString()
-      }), { EX: 600 }); // 10 minutes TTL
-    } catch (e) { err('cache write error', e?.message || e); }
+  async function warmupCookies() {
+    // Hit the hotspot login page FIRST; then portal root as secondary
+    const c = [];
+    const w1 = await makeClient('warm1').get(PORTAL_LOGIN_URL);
+    if (Array.isArray(w1.headers?.['set-cookie'])) c.push(...w1.headers['set-cookie']);
+    const w2 = await makeClient('warm2').get(PORTAL_ROOT_URL);
+    if (Array.isArray(w2.headers?.['set-cookie'])) c.push(...w2.headers['set-cookie']);
+    const cookieHeader = c.length ? { Cookie: c.map(s => String(s).split(';')[0]).join('; ') } : {};
+    return { cookies: c, cookieHeader };
   }
 
   async function controllerLogin() {
-    const warm = await makeClient('warmup').get(PORTAL_URL);
-    const warmCookies = warm.headers?.['set-cookie'] || [];
-    const cookieHeader = warmCookies.length ? { Cookie: warmCookies.map(c => String(c).split(';')[0]).join('; ') } : {};
+    const { cookies: warmSet, cookieHeader } = await warmupCookies();
 
-    let loginStatus = null, token = null, setCookie = warmCookies, rawHeaders = {};
+    let loginStatus = null, token = null, setCookie = warmSet, rawHeaders = {};
     for (const loginUrl of [LOGIN_URL_STD, LOGIN_URL_ALT]) {
       const resp = await makeClient('login').post(
         loginUrl,
@@ -478,37 +353,98 @@ export default async function handler(req, res) {
       );
       loginStatus = resp.status;
       rawHeaders = resp.headers || {};
-      token =
-        rawHeaders['csrf-token'] ||
-        rawHeaders['Csrf-Token'] ||
-        (resp.data && resp.data.result && resp.data.result.token) ||
-        null;
+      token = (resp.data && resp.data.result && resp.data.result.token) ||
+              rawHeaders['csrf-token'] || rawHeaders['Csrf-Token'] || null;
 
       if (!token) {
         const fromCookies = extractTokenFromHeaders(resp.headers?.['set-cookie'], rawHeaders);
         if (fromCookies) token = fromCookies;
       }
-      if (!token) {
-        const fromHtml = await extractTokenFromPortalHTML();
-        if (fromHtml) token = fromHtml;
+
+      // If token present, merge cookies and verify via loginStatus
+      if (token) {
+        const setC = resp.headers?.['set-cookie'] || [];
+        const merged = [...(warmSet || []), ...setC];
+        const cookieLine = merged.map(s => String(s).split(';')[0]).join('; ');
+        // Verify token/session really works
+        const ver = await makeClient('verify').get(LOGIN_STATUS(token), {
+          headers: {
+            Cookie: cookieLine,
+            'X-Requested-With': 'XMLHttpRequest',
+            'Csrf-Token': token
+          }
+        });
+        if (ver.status === 200 && ver.data && ver.data.result && ver.data.result.login === true) {
+          setCookie = merged;
+          return { token, setCookie, status: loginStatus, rawHeaders, verified: true };
+        } else {
+          // Token not valid; continue to try ALT login
+          token = null;
+        }
       }
-
-      if (token) { setCookie = resp.headers?.['set-cookie'] || setCookie; break; }
     }
-
-    const cookieString = (setCookie || []).map(c => String(c).split(';')[0]).join('; ');
-    return { token, cookie: cookieString, status: loginStatus, rawHeaders };
+    return { token: null, setCookie, status: loginStatus, rawHeaders, verified: false };
   }
 
+  // allow a short-lived cache in-memory per instance
+  const cacheKey = 'omada_login_cache';
+  const globalAny = globalThis;
+  const nowMs = Date.now();
+  let cached = globalAny[cacheKey];
+  if (cached && (nowMs - cached.t < 2 * 60 * 1000)) {
+    log('Using cached controller login (fresh)');
+  } else if (cached && (nowMs - cached.t < 10 * 60 * 1000)) {
+    log('Using cached controller login (stale-ok)');
+  } else {
+    cached = null;
+  }
+
+  async function getLoginState() {
+    if (cached) return cached.v;
+    const v = await controllerLogin();
+    globalAny[cacheKey] = { v, t: Date.now() };
+    return v;
+  }
+
+  const loginState = await getLoginState();
+  if (!loginState || !loginState.token) {
+    return res.status(502).json({
+      ok: false,
+      error: 'Hotspot login failed',
+      detail: 'controller login did not produce token',
+      omada: {
+        login: {
+          status: loginState?.status ?? null,
+          tokenPresent: !!loginState?.token,
+          verified: !!loginState?.verified,
+          cookies: Array.isArray(loginState?.setCookie) ? loginState.setCookie.length : null,
+          headerKeys: loginState?.rawHeaders ? Object.keys(loginState.rawHeaders) : null
+        }
+      }
+    });
+  }
+
+  const csrf = loginState.token;
+  const loginCookies = loginState.setCookie || [];
+  const cookieLine = loginCookies.map(c => String(c).split(';')[0]).join('; ');
+
+  const baseAuthHeaders = {
+    Cookie: cookieLine,
+    'Csrf-Token': csrf,
+    'X-Csrf-Token': csrf,
+    'X-Requested-With': 'XMLHttpRequest',
+    'Origin': base,
+    'Referer': PORTAL_LOGIN_URL,
+    Accept: 'application/json'
+  };
   const httpsAgentAuth = new https.Agent({ rejectUnauthorized: false, keepAlive: false, maxSockets: 1 });
   const httpAuth = axios.create({ timeout: 15000, httpsAgent: httpsAgentAuth, headers: { Accept: 'application/json' }, validateStatus: () => true });
-
-  const postJson = async (url, json, extraHeaders = {}) => {
-    const resp = await httpAuth.post(url, json, { headers: { 'Content-Type': 'application/json', ...extraHeaders } });
-    return { data: resp.data, status: resp.status, headers: resp.headers || {} };
+  const postJson = async (url, json, headers = {}) => {
+    const resp = await httpAuth.post(url, json, { headers: { 'Content-Type': 'application/json', ...headers } });
+    return { data: resp.data, status: resp.status };
   };
 
-  const timeMsBase = Math.max(60000, Number(plan.durationMs || 60000));
+  const timeMsBase = Math.max(60000, Number((await import('../lib/timeWindows.js')).planBasicSession ? plan.durationMs : 60000) || 60000);
   const macFormats = [
     { label: 'colons',     cm: macToColons(clientMacRaw), am: macToColons(apMacRaw) },
     { label: 'hyphens',    cm: macToHyphens(clientMacRaw), am: macToHyphens(apMacRaw) },
@@ -517,75 +453,30 @@ export default async function handler(req, res) {
   ];
   const authTypes = [4, 2];
 
-  const attemptMatrix = [];
   let authOk = false;
   let last = { status: 0, data: null, note: '' };
-  let loginState = null;
-  let usedLogin = 'cache-miss';
+  const authAttempts = [];
 
-  async function tryAuthWith(csrfToken, cookieString, tag) {
-    const baseAuthHeaders = {
-      Cookie: cookieString || '',
-      'Csrf-Token': csrfToken,
-      'X-Csrf-Token': csrfToken,
-      'X-Requested-With': 'XMLHttpRequest',
-      'Origin': base,
-      'Referer': PORTAL_URL,
-      Accept: 'application/json'
-    };
-    for (const mf of macFormats) {
-      for (const at of authTypes) {
-        const payload = {
-          clientMac: mf.cm,
-          apMac: mf.am,
-          ssidName,
-          ssid: ssidName,
-          radioId: Number(radioIdRaw) || 1,
-          site: siteId,
-          time: timeMsBase,
-          authType: at
-        };
-        const { data: authData, status: authStatus } = await postJson(AUTH_URL, payload, baseAuthHeaders);
-        last = { status: authStatus, data: authData, note: `${tag} | mac=${mf.label} authType=${at}` };
-        attemptMatrix.push({ status: authStatus, errorCode: authData?.errorCode, note: last.note });
-        if (authStatus === 200 && authData?.errorCode === 0) return true;
-        // -41501 indicates "need different MAC/authType" — continue matrix
-        if (authStatus === 200 && authData?.errorCode === -41501) continue;
-        // -1200 "logged out" or other errors: break inner loop to try fresh login
-        if (authData?.errorCode === -1200) return false;
-      }
+  outer:
+  for (const mf of macFormats) {
+    for (const at of authTypes) {
+      const payload = {
+        clientMac: mf.cm,
+        apMac: mf.am,
+        ssidName,
+        ssid: ssidName,
+        radioId: Number(radioIdRaw) || 1,
+        site: siteId,
+        time: timeMsBase,
+        authType: at
+      };
+      const { data: authData, status: authStatus } = await postJson(AUTH_URL, payload, baseAuthHeaders);
+      last = { status: authStatus, data: authData, note: `mac=${mf.label} authType=${at}` };
+      authAttempts.push({ status: authStatus, errorCode: authData?.errorCode, note: last.note });
+      if (authStatus === 200 && authData?.errorCode === 0) { authOk = true; break outer; }
+      // -41501 is often "wrong MAC format" → try next format, otherwise bail on other codes
+      if (!(authStatus === 200 && authData?.errorCode === -41501)) break;
     }
-    return false;
-  }
-
-  // 1) Try cached token/cookies first
-  const cached = await readCachedLogin();
-  if (cached && cached.token && cached.cookie) {
-    usedLogin = 'cache-hit';
-    authOk = await tryAuthWith(cached.token, cached.cookie, 'cache');
-  }
-
-  // 2) If cache failed, do controller login, cache it, then try auth again
-  if (!authOk) {
-    loginState = await controllerLogin();
-    if (!loginState || !loginState.token) {
-      return res.status(502).json({
-        ok: false,
-        error: 'Hotspot login failed',
-        detail: 'controller login did not produce token',
-        omada: {
-          login: {
-            status: loginState?.status ?? null,
-            tokenPresent: !!loginState?.token,
-            cookies: loginState?.cookie ? loginState.cookie.split(';').length : 0,
-            headerKeys: loginState?.rawHeaders ? Object.keys(loginState.rawHeaders) : null
-          }
-        }
-      });
-    }
-    usedLogin = 'fresh';
-    await writeCachedLogin({ token: loginState.token, cookie: loginState.cookie });
-    authOk = await tryAuthWith(loginState.token, loginState.cookie, 'fresh');
   }
 
   if (!authOk) {
@@ -595,14 +486,12 @@ export default async function handler(req, res) {
       error: 'Authorization failed',
       detail: last.data,
       attempt: last.note,
-      attempts: attemptMatrix,
+      attempts: authAttempts,
       omada: {
-        loginUse: usedLogin,
-        login: { status: loginState?.status || null, tokenPresent: !!(loginState?.token || (cached && cached.token)), cookies: (loginState?.cookie || (cached && cached.cookie) || '').split(';').filter(Boolean).length }
+        login: { status: loginState?.status || null, tokenPresent: !!loginState?.token, verified: !!loginState?.verified, cookies: (loginState?.setCookie || []).length }
       }
     });
   }
-  // ----------------- /Omada login/auth -----------------
 
   const nowIso = new Date().toISOString();
   const dateKey = localDateKey(new Date(), APP_TZ);
@@ -622,9 +511,7 @@ export default async function handler(req, res) {
       }),
       { EX: 6 * 3600 }
     );
-  } catch (e) {
-    err('Session write error', e?.message || e);
-  }
+  } catch (e) { err('Session write error', e?.message || e); }
 
   try {
     await redis.lPush(`w2g:events:${dateKey}`, JSON.stringify({
@@ -637,18 +524,14 @@ export default async function handler(req, res) {
       ssidName,
       site: siteName,
       siteId,
-      window: plan.window,
-      debitsApplied: took,
-      debitsSkipped: skip
+      window: plan.window
     }));
-  } catch (e) {
-    err('Events write error', e?.message || e);
-  }
+  } catch (e) { err('Events write error', e?.message || e); }
 
   const includeDebug = dbg.enabled ? {
     omada: {
-      loginUse: usedLogin,
-      auth:  { attempts: attemptMatrix, last }
+      login: { status: loginState?.status || null, tokenPresent: !!loginState?.token, verified: !!loginState?.verified, cookies: (loginState?.setCookie || []).length },
+      auth:  { attempts: authAttempts, chosen: last }
     }
   } : {};
 
@@ -658,8 +541,6 @@ export default async function handler(req, res) {
     cutoff: new Date(Date.now() + (plan.durationMs || 60000)).toISOString(),
     extended: !!extend,
     window: plan.window,
-    debitsApplied: took,
-    debitsSkipped: skip,
     message: plan.reason,
     ...includeDebug
   });
