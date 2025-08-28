@@ -1,7 +1,7 @@
 // api/authorize.js  Vercel Node runtime, ESM style
-// Build: 2025-08-28c  step 4 — Omada: add ?token= to auth URL, send seconds, safer referer, X-Requested-With on login
+// Build: 2025-08-28d  step 4 — cache Omada hotspot token+cookies in Redis and try cache-first before logging in
 
-console.log("DEBUG: authorize.js build version 2025-08-28c");
+console.log("DEBUG: authorize.js build version 2025-08-28d");
 
 export default async function handler(req, res) {
   const rid = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
@@ -47,8 +47,8 @@ export default async function handler(req, res) {
   const CTRL_ID = OMADA_CONTROLLER_ID;
   const LOGIN_URL_STD = `${base}/${CTRL_ID}/api/v2/hotspot/login`;
   const LOGIN_URL_ALT = `${base}/${CTRL_ID}/api/v2/hotspot/extPortal/login`;
-  const AUTH_URL_BASE = `${base}/${CTRL_ID}/api/v2/hotspot/extPortal/auth`;
-  const HOTSPOT_LOGIN = `${base}/${CTRL_ID}/hotspot/login`;
+  const AUTH_URL      = `${base}/${CTRL_ID}/api/v2/hotspot/extPortal/auth`;
+  const PORTAL_URL    = `${base}/${CTRL_ID}/portal`;
 
   const NEX_AUTH  = (NEXUDUS_USER && NEXUDUS_PASS)
     ? "Basic " + Buffer.from(`${NEXUDUS_USER}:${NEXUDUS_PASS}`).toString("base64")
@@ -69,7 +69,7 @@ export default async function handler(req, res) {
     (req.query && (req.query.debug || '')) ||
     (b.debug || '')
   ).toLowerCase().trim();
-  const dbg = { enabled: dbgProbe === 'omada' };
+  const dbg = { enabled: dbgProbe === 'omada' || dbgProbe === 'auth' || dbgProbe === 'debug' };
 
   const looksLikeId = (s) => /^[a-f0-9]{24}$/i.test(String(s || '').trim());
   const siteName = (OMADA_SITE_NAME && OMADA_SITE_NAME.trim())
@@ -242,12 +242,12 @@ export default async function handler(req, res) {
   }
 
   // Nexudus http
-  const nx = axios.create({
+  const nx = (NEXUDUS_BASE ? axios.create({
     baseURL: NEXUDUS_BASE?.replace(/\/+$/, ''),
     timeout: 15000,
     headers: { Accept: 'application/json', Authorization: NEX_AUTH || '' },
     validateStatus: () => true
-  });
+  }) : null);
 
   async function nxGetCoworkerByEmail(emailAddr) {
     const url = `/api/spaces/coworkers?Coworker_email=${encodeURIComponent(emailAddr)}&_take=1`;
@@ -405,7 +405,7 @@ export default async function handler(req, res) {
   }
   // -------------------------------------------------------------------
 
-  // ----------------- Omada login/auth with fallbacks -----------------
+  // ----------------- Omada login/auth with cache + fallbacks -----------------
   function makeClient(purpose) {
     const agent = new https.Agent({ rejectUnauthorized: false, keepAlive: false, maxSockets: 1 });
     const headers = {
@@ -416,11 +416,7 @@ export default async function handler(req, res) {
       Pragma: 'no-cache',
       'Accept-Language': 'en-US,en;q=0.9'
     };
-    if (purpose === 'login') {
-      headers['Origin'] = base;
-      headers['Referer'] = HOTSPOT_LOGIN;
-      headers['X-Requested-With'] = 'XMLHttpRequest';
-    }
+    if (purpose === 'login') { headers['Origin'] = base; headers['Referer'] = PORTAL_URL; }
     return axios.create({ timeout: 15000, httpsAgent: agent, headers, validateStatus: () => true, maxRedirects: 0 });
   }
 
@@ -438,7 +434,7 @@ export default async function handler(req, res) {
 
   async function extractTokenFromPortalHTML() {
     try {
-      const resp = await makeClient('warmup2').get(HOTSPOT_LOGIN);
+      const resp = await makeClient('warmup2').get(PORTAL_URL);
       const html = String(resp.data || '');
       let m = html.match(/name=["']csrf-token["'][^>]*content=["']([^"']+)["']/i);
       if (m) return m[1];
@@ -448,8 +444,28 @@ export default async function handler(req, res) {
     } catch { return null; }
   }
 
+  const CACHE_KEY = `w2g:omada:login:${CTRL_ID}`;
+  async function readCachedLogin() {
+    try {
+      const raw = await redis.get(CACHE_KEY);
+      if (!raw) return null;
+      const obj = JSON.parse(raw);
+      if (!obj || !obj.token || !obj.cookie) return null;
+      return obj;
+    } catch { return null; }
+  }
+  async function writeCachedLogin(obj) {
+    try {
+      await redis.set(CACHE_KEY, JSON.stringify({
+        token: obj.token || '',
+        cookie: obj.cookie || '',
+        when: new Date().toISOString()
+      }), { EX: 600 }); // 10 minutes TTL
+    } catch (e) { err('cache write error', e?.message || e); }
+  }
+
   async function controllerLogin() {
-    const warm = await makeClient('warmup').get(HOTSPOT_LOGIN);
+    const warm = await makeClient('warmup').get(PORTAL_URL);
     const warmCookies = warm.headers?.['set-cookie'] || [];
     const cookieHeader = warmCookies.length ? { Cookie: warmCookies.map(c => String(c).split(';')[0]).join('; ') } : {};
 
@@ -458,7 +474,7 @@ export default async function handler(req, res) {
       const resp = await makeClient('login').post(
         loginUrl,
         { name: OMADA_OPERATOR_USER, password: OMADA_OPERATOR_PASS },
-        { headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest', Origin: base, Referer: HOTSPOT_LOGIN, ...cookieHeader } }
+        { headers: { 'Content-Type': 'application/json', ...cookieHeader } }
       );
       loginStatus = resp.status;
       rawHeaders = resp.headers || {};
@@ -472,7 +488,6 @@ export default async function handler(req, res) {
         const fromCookies = extractTokenFromHeaders(resp.headers?.['set-cookie'], rawHeaders);
         if (fromCookies) token = fromCookies;
       }
-
       if (!token) {
         const fromHtml = await extractTokenFromPortalHTML();
         if (fromHtml) token = fromHtml;
@@ -480,46 +495,20 @@ export default async function handler(req, res) {
 
       if (token) { setCookie = resp.headers?.['set-cookie'] || setCookie; break; }
     }
-    return { token, setCookie, status: loginStatus, rawHeaders };
+
+    const cookieString = (setCookie || []).map(c => String(c).split(';')[0]).join('; ');
+    return { token, cookie: cookieString, status: loginStatus, rawHeaders };
   }
 
-  const loginState = await controllerLogin();
-  if (!loginState || !loginState.token) {
-    return res.status(502).json({
-      ok: false,
-      error: 'Hotspot login failed',
-      detail: 'controller login did not produce token',
-      omada: {
-        login: {
-          status: loginState?.status ?? null,
-          tokenPresent: !!loginState?.token,
-          cookies: Array.isArray(loginState?.setCookie) ? loginState.setCookie.length : null,
-          headerKeys: loginState?.rawHeaders ? Object.keys(loginState.rawHeaders) : null
-        }
-      }
-    });
-  }
-
-  const csrf = loginState.token;
-  const loginCookies = loginState.setCookie || [];
-  const baseAuthHeaders = {
-    Cookie: loginCookies.map(c => String(c).split(';')[0]).join('; '),
-    'Csrf-Token': csrf,
-    'X-Csrf-Token': csrf,
-    'X-Requested-With': 'XMLHttpRequest',
-    'Origin': base,
-    'Referer': HOTSPOT_LOGIN,
-    Accept: 'application/json'
-  };
   const httpsAgentAuth = new https.Agent({ rejectUnauthorized: false, keepAlive: false, maxSockets: 1 });
   const httpAuth = axios.create({ timeout: 15000, httpsAgent: httpsAgentAuth, headers: { Accept: 'application/json' }, validateStatus: () => true });
 
-  const postJson = async (url, json, headers = {}) => {
-    const resp = await httpAuth.post(url, json, { headers: { 'Content-Type': 'application/json', ...headers } });
-    return { data: resp.data, status: resp.status };
+  const postJson = async (url, json, extraHeaders = {}) => {
+    const resp = await httpAuth.post(url, json, { headers: { 'Content-Type': 'application/json', ...extraHeaders } });
+    return { data: resp.data, status: resp.status, headers: resp.headers || {} };
   };
 
-  const timeSec = Math.max(60, Math.round((plan.durationMs || 60000) / 1000));
+  const timeMsBase = Math.max(60000, Number(plan.durationMs || 60000));
   const macFormats = [
     { label: 'colons',     cm: macToColons(clientMacRaw), am: macToColons(apMacRaw) },
     { label: 'hyphens',    cm: macToHyphens(clientMacRaw), am: macToHyphens(apMacRaw) },
@@ -528,30 +517,75 @@ export default async function handler(req, res) {
   ];
   const authTypes = [4, 2];
 
+  const attemptMatrix = [];
   let authOk = false;
   let last = { status: 0, data: null, note: '' };
-  const authAttempts = [];
+  let loginState = null;
+  let usedLogin = 'cache-miss';
 
-  outer:
-  for (const mf of macFormats) {
-    for (const at of authTypes) {
-      const payload = {
-        clientMac: mf.cm,
-        apMac: mf.am,
-        ssidName,
-        ssid: ssidName,
-        radioId: Number(radioIdRaw) || 1,
-        site: siteId,
-        time: timeSec,
-        authType: at
-      };
-      const authUrl = `${AUTH_URL_BASE}?token=${encodeURIComponent(csrf)}`;
-      const { data: authData, status: authStatus } = await postJson(authUrl, payload, baseAuthHeaders);
-      last = { status: authStatus, data: authData, note: `mac=${mf.label} authType=${at}` };
-      authAttempts.push({ status: authStatus, errorCode: authData?.errorCode, note: last.note });
-      if (authStatus === 200 && authData?.errorCode === 0) { authOk = true; break outer; }
-      if (!(authStatus === 200 && authData?.errorCode === -41501)) break;
+  async function tryAuthWith(csrfToken, cookieString, tag) {
+    const baseAuthHeaders = {
+      Cookie: cookieString || '',
+      'Csrf-Token': csrfToken,
+      'X-Csrf-Token': csrfToken,
+      'X-Requested-With': 'XMLHttpRequest',
+      'Origin': base,
+      'Referer': PORTAL_URL,
+      Accept: 'application/json'
+    };
+    for (const mf of macFormats) {
+      for (const at of authTypes) {
+        const payload = {
+          clientMac: mf.cm,
+          apMac: mf.am,
+          ssidName,
+          ssid: ssidName,
+          radioId: Number(radioIdRaw) || 1,
+          site: siteId,
+          time: timeMsBase,
+          authType: at
+        };
+        const { data: authData, status: authStatus } = await postJson(AUTH_URL, payload, baseAuthHeaders);
+        last = { status: authStatus, data: authData, note: `${tag} | mac=${mf.label} authType=${at}` };
+        attemptMatrix.push({ status: authStatus, errorCode: authData?.errorCode, note: last.note });
+        if (authStatus === 200 && authData?.errorCode === 0) return true;
+        // -41501 indicates "need different MAC/authType" — continue matrix
+        if (authStatus === 200 && authData?.errorCode === -41501) continue;
+        // -1200 "logged out" or other errors: break inner loop to try fresh login
+        if (authData?.errorCode === -1200) return false;
+      }
     }
+    return false;
+  }
+
+  // 1) Try cached token/cookies first
+  const cached = await readCachedLogin();
+  if (cached && cached.token && cached.cookie) {
+    usedLogin = 'cache-hit';
+    authOk = await tryAuthWith(cached.token, cached.cookie, 'cache');
+  }
+
+  // 2) If cache failed, do controller login, cache it, then try auth again
+  if (!authOk) {
+    loginState = await controllerLogin();
+    if (!loginState || !loginState.token) {
+      return res.status(502).json({
+        ok: false,
+        error: 'Hotspot login failed',
+        detail: 'controller login did not produce token',
+        omada: {
+          login: {
+            status: loginState?.status ?? null,
+            tokenPresent: !!loginState?.token,
+            cookies: loginState?.cookie ? loginState.cookie.split(';').length : 0,
+            headerKeys: loginState?.rawHeaders ? Object.keys(loginState.rawHeaders) : null
+          }
+        }
+      });
+    }
+    usedLogin = 'fresh';
+    await writeCachedLogin({ token: loginState.token, cookie: loginState.cookie });
+    authOk = await tryAuthWith(loginState.token, loginState.cookie, 'fresh');
   }
 
   if (!authOk) {
@@ -561,12 +595,14 @@ export default async function handler(req, res) {
       error: 'Authorization failed',
       detail: last.data,
       attempt: last.note,
-      attempts: authAttempts,
+      attempts: attemptMatrix,
       omada: {
-        login: { status: loginState?.status || null, tokenPresent: !!loginState?.token, cookies: (loginState?.setCookie || []).length }
+        loginUse: usedLogin,
+        login: { status: loginState?.status || null, tokenPresent: !!(loginState?.token || (cached && cached.token)), cookies: (loginState?.cookie || (cached && cached.cookie) || '').split(';').filter(Boolean).length }
       }
     });
   }
+  // ----------------- /Omada login/auth -----------------
 
   const nowIso = new Date().toISOString();
   const dateKey = localDateKey(new Date(), APP_TZ);
@@ -611,8 +647,8 @@ export default async function handler(req, res) {
 
   const includeDebug = dbg.enabled ? {
     omada: {
-      login: { status: loginState?.status || null, tokenPresent: !!loginState?.token, cookies: (loginState?.setCookie || []).length },
-      auth:  { attempts: authAttempts, chosen: last }
+      loginUse: usedLogin,
+      auth:  { attempts: attemptMatrix, last }
     }
   } : {};
 
