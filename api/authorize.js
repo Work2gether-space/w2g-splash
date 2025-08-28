@@ -1,7 +1,7 @@
 // api/authorize.js  Vercel Node runtime, ESM style
-// Build: 2025-08-28e  step 3 — use /hotspot/login warmup + referer, verify loginStatus before auth
+// Build: 2025-08-28f  parity with omada_probe (Referer=/portal, X-Requested-With on login), fix timeMsBase
 
-console.log("DEBUG: authorize.js build version 2025-08-28e");
+console.log("DEBUG: authorize.js build version 2025-08-28f");
 
 export default async function handler(req, res) {
   const rid = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
@@ -46,19 +46,20 @@ export default async function handler(req, res) {
   const base = OMADA_BASE.replace(/\/+$/, '');
   const CTRL_ID = OMADA_CONTROLLER_ID;
 
-  // IMPORTANT: prefer hotspot login page for warmup/referer
-  const PORTAL_LOGIN_URL = `${base}/${CTRL_ID}/hotspot/login`;
-  const PORTAL_ROOT_URL  = `${base}/${CTRL_ID}/portal`;
+  // Endpoints
+  const PORTAL_URL       = `${base}/${CTRL_ID}/portal`;
+  const HOTSPOT_LOGIN    = `${base}/${CTRL_ID}/hotspot/login`;
+  const LOGIN_URL_STD    = `${base}/${CTRL_ID}/api/v2/hotspot/login`;
+  const LOGIN_URL_ALT    = `${base}/${CTRL_ID}/api/v2/hotspot/extPortal/login`;
+  const AUTH_URL         = `${base}/${CTRL_ID}/api/v2/hotspot/extPortal/auth`;
+  const LOGIN_STATUS     = (token) => `${base}/${CTRL_ID}/api/v2/hotspot/loginStatus?token=${encodeURIComponent(token || '')}`;
 
-  const LOGIN_URL_STD = `${base}/${CTRL_ID}/api/v2/hotspot/login`;
-  const LOGIN_URL_ALT = `${base}/${CTRL_ID}/api/v2/hotspot/extPortal/login`;
-  const AUTH_URL      = `${base}/${CTRL_ID}/api/v2/hotspot/extPortal/auth`;
-  const LOGIN_STATUS  = (token) => `${base}/${CTRL_ID}/api/v2/hotspot/loginStatus?token=${encodeURIComponent(token || '')}`;
-
+  // Nexudus HTTP auth header
   const NEX_AUTH  = (NEXUDUS_USER && NEXUDUS_PASS)
     ? "Basic " + Buffer.from(`${NEXUDUS_USER}:${NEXUDUS_PASS}`).toString("base64")
     : null;
 
+  // Body + debug flag
   const b = (req.body && typeof req.body === 'object') ? req.body : {};
   const clientMacRaw = b.clientMac || b.client_id || '';
   const apMacRaw     = b.apMac || '';
@@ -76,6 +77,7 @@ export default async function handler(req, res) {
   ).toLowerCase().trim();
   const dbg = { enabled: dbgProbe === 'omada' };
 
+  // Site identification
   const looksLikeId = (s) => /^[a-f0-9]{24}$/i.test(String(s || '').trim());
   const siteName = (OMADA_SITE_NAME && OMADA_SITE_NAME.trim())
                 || (looksLikeId(siteFromBody) ? '' : siteFromBody)
@@ -84,6 +86,7 @@ export default async function handler(req, res) {
              : looksLikeId(OMADA_SITE_ID) ? OMADA_SITE_ID
              : null;
 
+  // MAC helpers
   const macHex = mac => String(mac || '').toUpperCase().replace(/[^0-9A-F]/g, '');
   const macToColons  = mac => {
     const hex = macHex(mac);
@@ -98,6 +101,7 @@ export default async function handler(req, res) {
   const macPlain = mac => macHex(mac);
   const macPlainLower = mac => macPlain(mac).toLowerCase();
 
+  // Pricing helpers
   function toInt(v, d) { const n = Number(v); return Number.isFinite(n) ? Math.round(n) : d; }
   function amountForCharge(code) {
     if (code === 'daily')       return toInt(BASIC_SESSION_CENTS, 500);
@@ -124,7 +128,7 @@ export default async function handler(req, res) {
     return `${y}-${m}-${d}`;
   }
 
-  // ---------- PROBES (redis/ledger) ----------
+  // ---------- PROBES ----------
   if (dbgProbe === 'redis') {
     try {
       const { getRedis } = await import('../lib/redis.js');
@@ -171,7 +175,7 @@ export default async function handler(req, res) {
       });
     } catch (e) { err('ledger read-back error', e?.message || e); return res.status(500).json({ ok:false, probe:'ledger', error:String(e?.message || e) }); }
   }
-  // ------------------------------------------
+  // ---------------------------
 
   // validation
   if (!clientMacRaw || !siteId) return res.status(400).json({ ok: false, error: !clientMacRaw ? 'Missing clientMac' : 'Missing Omada site id' });
@@ -267,7 +271,7 @@ export default async function handler(req, res) {
     if (!plan || !plan.allow) return res.status(403).json({ ok: false, error: plan?.reason || 'Denied' });
   } catch (e) { err('Time planner error:', e?.message || e); return res.status(500).json({ ok: false, error: 'Time planner failed' }); }
 
-  // Monthly ledger preview + apply debits (same as prior builds)
+  // Monthly ledger preview + apply debits
   try {
     const cycleKey = localCycleKey(new Date(), APP_TZ);
     const { ledgerKey, eventsKey } = creditKeys(cycleKey, coworker.Id);
@@ -311,8 +315,8 @@ export default async function handler(req, res) {
       'Cache-Control': 'no-cache',
       Pragma: 'no-cache',
       'Accept-Language': 'en-US,en;q=0.9',
-      // Use hotspot page as referer for both login and auth
-      'Referer': PORTAL_LOGIN_URL,
+      // IMPORTANT: match probe — use /portal as Referer
+      'Referer': PORTAL_URL,
       'Origin': base
     };
     return axios.create({ timeout: 15000, httpsAgent: agent, headers, validateStatus: () => true, maxRedirects: 0 });
@@ -331,11 +335,11 @@ export default async function handler(req, res) {
   }
 
   async function warmupCookies() {
-    // Hit the hotspot login page FIRST; then portal root as secondary
+    // Try hotspot login page first, then portal
     const c = [];
-    const w1 = await makeClient('warm1').get(PORTAL_LOGIN_URL);
+    const w1 = await makeClient('warm-hotspot').get(HOTSPOT_LOGIN);
     if (Array.isArray(w1.headers?.['set-cookie'])) c.push(...w1.headers['set-cookie']);
-    const w2 = await makeClient('warm2').get(PORTAL_ROOT_URL);
+    const w2 = await makeClient('warm-portal').get(PORTAL_URL);
     if (Array.isArray(w2.headers?.['set-cookie'])) c.push(...w2.headers['set-cookie']);
     const cookieHeader = c.length ? { Cookie: c.map(s => String(s).split(';')[0]).join('; ') } : {};
     return { cookies: c, cookieHeader };
@@ -349,7 +353,7 @@ export default async function handler(req, res) {
       const resp = await makeClient('login').post(
         loginUrl,
         { name: OMADA_OPERATOR_USER, password: OMADA_OPERATOR_PASS },
-        { headers: { 'Content-Type': 'application/json', ...cookieHeader } }
+        { headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest', ...cookieHeader } } // <-- add X-Requested-With
       );
       loginStatus = resp.status;
       rawHeaders = resp.headers || {};
@@ -361,13 +365,11 @@ export default async function handler(req, res) {
         if (fromCookies) token = fromCookies;
       }
 
-      // If token present, merge cookies and verify via loginStatus
       if (token) {
-        const setC = resp.headers?.['set-cookie'] || [];
-        const merged = [...(warmSet || []), ...setC];
+        // verify with loginStatus, just like probe
+        const merged = [...(warmSet || []), ... (resp.headers?.['set-cookie'] || [])];
         const cookieLine = merged.map(s => String(s).split(';')[0]).join('; ');
-        // Verify token/session really works
-        const ver = await makeClient('verify').get(LOGIN_STATUS(token), {
+        const ver = await makeClient('status').get(LOGIN_STATUS(token), {
           headers: {
             Cookie: cookieLine,
             'X-Requested-With': 'XMLHttpRequest',
@@ -378,15 +380,14 @@ export default async function handler(req, res) {
           setCookie = merged;
           return { token, setCookie, status: loginStatus, rawHeaders, verified: true };
         } else {
-          // Token not valid; continue to try ALT login
-          token = null;
+          token = null; // try ALT path if std failed verification
         }
       }
     }
     return { token: null, setCookie, status: loginStatus, rawHeaders, verified: false };
   }
 
-  // allow a short-lived cache in-memory per instance
+  // small in-memory cache to avoid re-login storms
   const cacheKey = 'omada_login_cache';
   const globalAny = globalThis;
   const nowMs = Date.now();
@@ -434,7 +435,7 @@ export default async function handler(req, res) {
     'X-Csrf-Token': csrf,
     'X-Requested-With': 'XMLHttpRequest',
     'Origin': base,
-    'Referer': PORTAL_LOGIN_URL,
+    'Referer': PORTAL_URL, // match probe
     Accept: 'application/json'
   };
   const httpsAgentAuth = new https.Agent({ rejectUnauthorized: false, keepAlive: false, maxSockets: 1 });
@@ -444,7 +445,9 @@ export default async function handler(req, res) {
     return { data: resp.data, status: resp.status };
   };
 
-  const timeMsBase = Math.max(60000, Number((await import('../lib/timeWindows.js')).planBasicSession ? plan.durationMs : 60000) || 60000);
+  // Use the planner's duration directly (fix)
+  const timeMsBase = Math.max(60000, Number((plan && plan.durationMs) || 60000));
+
   const macFormats = [
     { label: 'colons',     cm: macToColons(clientMacRaw), am: macToColons(apMacRaw) },
     { label: 'hyphens',    cm: macToHyphens(clientMacRaw), am: macToHyphens(apMacRaw) },
@@ -474,7 +477,6 @@ export default async function handler(req, res) {
       last = { status: authStatus, data: authData, note: `mac=${mf.label} authType=${at}` };
       authAttempts.push({ status: authStatus, errorCode: authData?.errorCode, note: last.note });
       if (authStatus === 200 && authData?.errorCode === 0) { authOk = true; break outer; }
-      // -41501 is often "wrong MAC format" → try next format, otherwise bail on other codes
       if (!(authStatus === 200 && authData?.errorCode === -41501)) break;
     }
   }
