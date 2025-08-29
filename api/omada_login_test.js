@@ -1,6 +1,6 @@
 // api/omada_login_test.js
-// Safe test endpoint that exercises the shared Omada hotspot client
-// without changing /api/authorize behavior yet.
+// Exercises External Portal auth via the shared client.
+// POST JSON body supports overrides; defaults are your real test params.
 
 const { hotspotLogin } = require("../lib/omada_hotspot_client");
 
@@ -32,7 +32,6 @@ module.exports = async (req, res) => {
 
   const body = await readBody(req);
 
-  // Allow override via body; default to known-good test params
   const site = body.site || "688c13adee75005c5bb411bd";
   const clientMac = body.clientMac || "C8-5E-A9-EE-D9-46";
   const apMac = body.apMac || "30-68-93-E9-96-AE";
@@ -42,16 +41,23 @@ module.exports = async (req, res) => {
   try {
     const result = await hotspotLogin({ site, clientMac, apMac, ssidName, radioId });
 
+    // Normalize a concise verdict for quick reading
+    const verdict =
+      result?.auth?.data?.errorCode === 0
+        ? "AUTHORIZED"
+        : `AUTH_FAIL(${result?.auth?.data?.errorCode})`;
+
     return json(res, 200, {
-      ok: true,
-      test: "omada_login_test",
+      ok: result?.auth?.data?.errorCode === 0,
+      test: "omada_login_test (external portal /auth)",
       input: { site, clientMac, apMac, ssidName, radioId },
+      verdict,
       result,
     });
   } catch (err) {
     return json(res, 200, {
       ok: false,
-      test: "omada_login_test",
+      test: "omada_login_test (external portal /auth)",
       error: err?.message || String(err),
     });
   }
