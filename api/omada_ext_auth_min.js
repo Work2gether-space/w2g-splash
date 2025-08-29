@@ -1,4 +1,4 @@
-// api/omada_ext_auth_min.js — form-encoded username/authType + authResult
+// api/omada_ext_auth_min.js — EXTREMELY MINIMAL extPortal/auth: clientMac + authResult (form-encoded)
 const OMADA_BASE = (process.env.OMADA_BASE || "https://omada.work2gether.space").replace(/\/+$/, "");
 const CTRL = process.env.OMADA_CONTROLLER_ID || "fc2b25d44a950a6357313da0afb4c14a";
 const OP_USER = process.env.OMADA_OPERATOR_USER;
@@ -13,7 +13,7 @@ function mergeCookies(a,b){ const m=new Map(); for(const c of [...a,...b]){ cons
 async function fWithCookies(url,opts={},jar=[]){
   const headers = new Headers(opts.headers||{});
   if(jar.length) headers.set("Cookie", jar.join("; "));
-  headers.set("User-Agent","w2g-ext-auth-username-form/2025-08-29");
+  headers.set("User-Agent","w2g-ext-auth-min-STRICT/2025-08-29");
   headers.set("Accept","application/json,text/html;q=0.9,*/*;q=0.1");
   headers.set("Connection","close");
   headers.set("Pragma","no-cache");
@@ -26,7 +26,11 @@ async function fWithCookies(url,opts={},jar=[]){
   return { resp, jar: mergeCookies(jar,set) };
 }
 
-function macColons(mac){ const hex=String(mac).replace(/[^0-9a-f]/gi,"").toUpperCase(); if(hex.length!==12) return mac; return hex.match(/.{1,2}/g).join(":"); }
+function macColons(mac){
+  const hex=String(mac).replace(/[^0-9a-f]/gi,"").toUpperCase();
+  if(hex.length!==12) return mac;
+  return hex.match(/.{1,2}/g).join(":");
+}
 
 async function operatorLogin(jar=[]){
   const url = `${OMADA_BASE}/${CTRL}/api/v2/hotspot/login?_=${Date.now()}`;
@@ -44,8 +48,7 @@ module.exports = async (req,res)=>{
   if(!OP_USER || !OP_PASS) return send(res,500,{ ok:false, error:"Missing OMADA_OPERATOR_USER/PASS" });
 
   const b = await readBody(req);
-  const site = b.site || "688c13adee75005c5bb411bd";
-  const username = macColons(b.clientMac || "C8-5E-A9-EE-D9-46");
+  const clientMac = macColons(b.clientMac || "C8-5E-A9-EE-D9-46");
 
   try{
     // warm cookies
@@ -56,12 +59,10 @@ module.exports = async (req,res)=>{
     // operator login
     const op = await operatorLogin(jar); jar = op.jar; const token = op.token || null;
 
-    // extPortal/auth — FORM ENCODED
+    // EXTREMELY MINIMAL extPortal/auth: ONLY clientMac + authResult
     const authUrl = `${OMADA_BASE}/${CTRL}/api/v2/hotspot/extPortal/auth?_=${Date.now()}`;
     const form = new URLSearchParams();
-    form.set("site", site);
-    form.set("username", username);
-    form.set("authType", "4");
+    form.set("clientMac", clientMac);
     form.set("authResult", "1"); // allow
     const headers = {
       "Content-Type":"application/x-www-form-urlencoded",
@@ -75,7 +76,7 @@ module.exports = async (req,res)=>{
 
     return send(res,200,{
       ok: data?.errorCode === 0,
-      input: { site, username, authType:4, authResult:1 },
+      input: { clientMac },
       operatorLogin: { status: op.status, token: !!token },
       auth: { http: r.resp.status, data, posted: Object.fromEntries(form.entries()) }
     });
