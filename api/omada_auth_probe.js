@@ -1,10 +1,10 @@
 // api/omada_auth_probe.js
-// Probes /api/v2/hotspot/extPortal/auth with multiple body shapes:
-// - ssidName vs ssid
-// - optional clientIp and redirectUrl
+// Probes /extPortal/auth with multiple path/body/CSRF/MAC variants.
+// Tries:
+// - Paths: /api/v2/hotspot/extPortal/auth, /api/v2/portal/extPortal/auth, /api/v2/extPortal/auth
+// - CSRF header: Csrf-Token, X-Csrf-Token
 // - MAC formats: colons, hyphens, rawhex
-//
-// Uses the same shared client helpers/headers as our new flow.
+// - Body shapes: ssidName vs ssid, optional clientIp & redirectUrl, and an "all_extras" combo
 
 const { macColons, macHyphens, macRaw } = require("../lib/omada_hotspot_client");
 
@@ -28,6 +28,7 @@ function readBody(req) {
   });
 }
 
+// ---- cookie + request helpers ----
 function parseSetCookie(h) {
   const out = [];
   if (!h) return out;
@@ -49,26 +50,32 @@ function mergeCookies(a, b) {
 async function fWithCookies(url, opts = {}, jar = []) {
   const headers = new Headers(opts.headers || {});
   if (jar.length) headers.set("Cookie", jar.join("; "));
-  if (!headers.has("User-Agent")) headers.set("User-Agent", "w2g-auth-probe/2025-08-29");
-  headers.set("Accept", "application/json,text/html;q=0.9,*/*;q=0.1");
+  if (!headers.has("User-Agent")) headers.set("User-Agent", "w2g-auth-probe/2025-09-02");
+  if (!headers.has("Accept")) headers.set("Accept", "application/json,text/html;q=0.9,*/*;q=0.1");
   headers.set("Connection", "close");
   headers.set("Pragma", "no-cache");
   headers.set("Cache-Control", "no-cache");
-  headers.set("Accept-Language", "en-US,en;q=0.9");
-  headers.set("Origin", OMADA_BASE);
-  headers.set("Referer", `${OMADA_BASE}/${CTRL}/portal`);
+  if (!headers.has("Accept-Language")) headers.set("Accept-Language", "en-US,en;q=0.9");
+  if (!headers.has("Origin")) headers.set("Origin", OMADA_BASE);
+  // IMPORTANT: don't overwrite Referer if caller supplied one
+  if (!headers.has("Referer")) headers.set("Referer", `${OMADA_BASE}/${CTRL}/portal`);
+
   const resp = await fetch(url, {
     method: opts.method || "GET",
-    headers, body: opts.body, redirect: "manual",
+    headers,
+    body: opts.body,
+    redirect: "manual",
   });
+
   const set = parseSetCookie(resp.headers.get("set-cookie"));
   return { resp, jar: mergeCookies(jar, set) };
 }
 
-async function preflight(jar=[]) {
+// ---- warm + operator login ----
+async function preflight(jar = []) {
   const url = `${OMADA_BASE}/${CTRL}/hotspot/login?_=${Date.now()}`;
-  const { resp, jar: j1 } = await fWithCookies(url, { method: "GET" }, jar);
-  await resp.text().catch(()=>{});
+  const { resp, jar: j1 } = await fWithCookies(url, { method: "GET", headers: { Referer: `${OMADA_BASE}/${CTRL}/hotspot/login` } }, jar);
+  await resp.text().catch(() => {});
   return { status: resp.status, jar: j1 };
 }
 
@@ -83,97 +90,160 @@ function extractTokenPieces(resp, bodyText) {
   } catch {}
   const hdrToken = hdrs["csrf-token"] || hdrs["x-csrf-token"] || null;
   const sc = resp.headers.get("set-cookie") || "";
-  const m = String(sc).match(/csrf[-_]?token=([^;]+)/i) || String(sc).match(/x[-_]?csrf[-_]?token=([^;]+)/i) || String(sc).match(/portal[-_]?csrf=([^;]+)/i);
+  const m =
+    String(sc).match(/csrf[-_]?token=([^;]+)/i) ||
+    String(sc).match(/x[-_]?csrf[-_]?token=([^;]+)/i) ||
+    String(sc).match(/portal[-_]?csrf=([^;]+)/i);
   const cookieToken = m ? m[1] : null;
   return { bodyToken, hdrToken, cookieToken };
 }
 
-async function operatorLogin(jar=[]) {
+async function operatorLogin(jar = []) {
   const url = `${OMADA_BASE}/${CTRL}/api/v2/hotspot/login?_=${Date.now()}`;
-  const headers = { "Content-Type": "application/json", "X-Requested-With": "XMLHttpRequest", Referer: `${OMADA_BASE}/${CTRL}/portal` };
+  const headers = {
+    "Content-Type": "application/json",
+    "X-Requested-With": "XMLHttpRequest",
+    Referer: `${OMADA_BASE}/${CTRL}/hotspot/login`
+  };
   const body = JSON.stringify({ name: process.env.OMADA_OPERATOR_USER, password: process.env.OMADA_OPERATOR_PASS });
   const { resp, jar: j2 } = await fWithCookies(url, { method: "POST", headers, body }, jar);
-  const text = await resp.text().catch(()=> "");
+  const text = await resp.text().catch(() => "");
   const t = extractTokenPieces(resp, text);
   const token = t.bodyToken || t.hdrToken || t.cookieToken || null;
   return { status: resp.status, token, jar: j2, raw: text };
 }
 
-async function postAuth(jar=[], token, body) {
-  const url = `${OMADA_BASE}/${CTRL}/api/v2/hotspot/extPortal/auth?_=${Date.now()}`;
+// ---- POST /extPortal/auth with variants ----
+async function postAuth({ jar, token, path, body, referer, csrfHeaderName }) {
+  const url = `${OMADA_BASE}/${CTRL}${path}?_=${Date.now()}`;
   const headers = {
     "Content-Type": "application/json",
     "X-Requested-With": "XMLHttpRequest",
-    Referer: `${OMADA_BASE}/${CTRL}/hotspot/login`,
-    ...(token ? { "Csrf-Token": token } : {}),
+    Referer: `${OMADA_BASE}/${CTRL}${referer}`
   };
+  if (token && csrfHeaderName) headers[csrfHeaderName] = token;
+
   const { resp, jar: j2 } = await fWithCookies(url, { method: "POST", headers, body: JSON.stringify(body) }, jar);
-  const text = await resp.text().catch(()=> "");
-  let data; try { data = JSON.parse(text); } catch { data = { errorCode:-1, msg:"Non-JSON", raw:text }; }
+  const text = await resp.text().catch(() => "");
+  let data; try { data = JSON.parse(text); } catch { data = { errorCode: -1, msg: "Non-JSON", raw: text }; }
   return { status: resp.status, data, posted: body, jar: j2 };
 }
 
+// ---- small utils ----
+function pick(obj, ...keys) {
+  for (const k of keys) {
+    const v = obj?.[k];
+    if (v !== undefined && v !== null && String(v).trim() !== "") return String(v).trim();
+  }
+  return "";
+}
+
+function normalizeRedirect(url) {
+  const s = String(url || "").trim();
+  if (!s) return "http://neverssl.com";
+  let v = s;
+  try { v = decodeURIComponent(s); } catch {}
+  if (/captiveportal|connecttest|generate_204|msftconnecttest|wifiportal/i.test(v)) {
+    return "http://neverssl.com";
+  }
+  return v;
+}
+
 module.exports = async (req, res) => {
-  if (req.method !== "POST") return json(res, 405, { ok:false, error:"Use POST." });
+  if (req.method !== "POST") return json(res, 405, { ok: false, error: "Use POST." });
+
   const b = await readBody(req);
 
-  const site = b.site || "688c13adee75005c5bb411bd";
-  const clientMac = b.clientMac || "C8-5E-A9-EE-D9-46";
-  const apMac = b.apMac || "30-68-93-E9-96-AE";
-  const ssid = b.ssid || "W2G_Basic";
-  const ssidName = b.ssidName || "W2G_Basic";
-  const radioId = b.radioId ?? 0;
-  const clientIp = b.clientIp || "192.168.20.109";
-  const redirectUrl = b.redirectUrl || "http://neverssl.com";
+  // Inputs with safe fallbacks and consistent typing (radioId as string)
+  const site       = pick(b, "site", "siteId") || "688c13adee75005c5bb411bd";
+  const clientMacI = pick(b, "clientMac") || "C8-5E-A9-EE-D9-46";
+  const apMacI     = pick(b, "apMac") || "30-68-93-E9-96-AE";
+  const ssidName   = pick(b, "ssidName", "ssid") || "W2G_Basic";
+  const ssid       = pick(b, "ssid", "ssidName") || "W2G_Basic";
+  const radioId    = pick(b, "radioId", "radio") || "1";
+  const clientIp   = pick(b, "clientIp") || "192.168.20.109";
+  const redirectUrl= normalizeRedirect(pick(b, "redirectUrl") || "http://neverssl.com");
 
   try {
     // 0) warm + 1) operator login
     let jar = [];
     const pf = await preflight(jar); jar = pf.jar;
-    const op = await operatorLogin(jar); jar = op.jar; const token = op.token || null;
+    const op = await operatorLogin(jar); jar = op.jar;
+    const token = op.token || null;
 
     // mac variants
-    const v = [
-      { fmt:"colons",  cm: macColons(clientMac), am: macColons(apMac) },
-      { fmt:"hyphens", cm: macHyphens(clientMac), am: macHyphens(apMac) },
-      { fmt:"rawhex",  cm: macRaw(clientMac),    am: macRaw(apMac) },
+    const macs = [
+      { fmt: "colons",  cm: macColons(clientMacI), am: macColons(apMacI) },
+      { fmt: "hyphens", cm: macHyphens(clientMacI), am: macHyphens(apMacI) },
+      { fmt: "rawhex",  cm: macRaw(clientMacI),    am: macRaw(apMacI) },
     ];
 
     // body shapes
     const shapes = [
-      { name:"ssidName_only", build:(cm,am)=>({ site, clientMac:cm, apMac:am, ssidName, radioId }) },
-      { name:"ssidName_plus_clientIp", build:(cm,am)=>({ site, clientMac:cm, apMac:am, ssidName, radioId, clientIp }) },
-      { name:"ssidName_plus_redirect", build:(cm,am)=>({ site, clientMac:cm, apMac:am, ssidName, radioId, redirectUrl }) },
-      { name:"ssid_and_ssidName", build:(cm,am)=>({ site, clientMac:cm, apMac:am, ssidName, ssid, radioId }) },
-      { name:"ssid_only", build:(cm,am)=>({ site, clientMac:cm, apMac:am, ssid, radioId }) },
-      { name:"all_extras", build:(cm,am)=>({ site, clientMac:cm, apMac:am, ssidName, ssid, radioId, clientIp, redirectUrl }) },
+      { name: "ssidName_only", build: (cm, am) => ({ site, clientMac: cm, apMac: am, ssidName, radioId }) },
+      { name: "ssid_only",     build: (cm, am) => ({ site, clientMac: cm, apMac: am, ssid,     radioId }) },
+      { name: "plus_clientIp", build: (cm, am) => ({ site, clientMac: cm, apMac: am, ssidName, radioId, clientIp }) },
+      { name: "plus_redirect", build: (cm, am) => ({ site, clientMac: cm, apMac: am, ssidName, radioId, redirectUrl }) },
+      { name: "all_extras",    build: (cm, am) => ({ site, clientMac: cm, apMac: am, ssidName, ssid, radioId, clientIp, redirectUrl }) },
     ];
+
+    // path + csrf variants
+    const paths = [
+      { path: "/api/v2/hotspot/extPortal/auth", referer: "/hotspot/login" },
+      { path: "/api/v2/portal/extPortal/auth",  referer: "/portal"        },
+      { path: "/api/v2/extPortal/auth",         referer: "/portal"        },
+    ];
+    const csrfNames = ["Csrf-Token", "X-Csrf-Token"];
 
     const attempts = [];
     let chosen = null;
 
-    for (const m of v) {
-      for (const s of shapes) {
-        const body = s.build(m.cm, m.am);
-        const r = await postAuth(jar, token, body);
-        attempts.push({ macFormat:m.fmt, shape:s.name, http:r.status, data:r.data, posted:r.posted });
-        if (r.data && r.data.errorCode === 0) {
-          chosen = { macFormat:m.fmt, shape:s.name, http:r.status, data:r.data, posted:r.posted };
-          break;
+    for (const p of paths) {
+      for (const m of macs) {
+        for (const s of shapes) {
+          for (const cName of csrfNames) {
+            const body = s.build(m.cm, m.am);
+            const r = await postAuth({
+              jar,
+              token,
+              path: p.path,
+              body,
+              referer: p.referer,
+              csrfHeaderName: cName
+            });
+            attempts.push({
+              path: p.path,
+              referer: p.referer,
+              macFormat: m.fmt,
+              shape: s.name,
+              csrfHeader: cName,
+              http: r.status,
+              data: r.data,
+              posted: r.posted,
+            });
+            jar = r.jar;
+
+            if (r.data && Number(r.data.errorCode) === 0) {
+              chosen = attempts[attempts.length - 1];
+              break;
+            }
+          }
+          if (chosen) break;
         }
+        if (chosen) break;
       }
       if (chosen) break;
     }
 
     return json(res, 200, {
-      ok: !!chosen,
+      ok: Boolean(chosen),
       mode: "extPortal auth probe",
-      input: { site, clientMac, apMac, ssid, ssidName, radioId, clientIp, redirectUrl },
+      input: { site, clientMac: clientMacI, apMac: apMacI, ssid, ssidName, radioId, clientIp, redirectUrl },
       operatorLogin: { status: op.status, token: !!token },
       attempts,
       chosen,
     });
   } catch (e) {
-    return json(res, 200, { ok:false, error: e?.message || String(e) });
+    return json(res, 200, { ok: false, error: e?.message || String(e) });
   }
 };
