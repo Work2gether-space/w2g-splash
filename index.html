@@ -37,7 +37,6 @@
     <h1>Welcome to Work2gether</h1>
     <p>Basic hours: Mon to Fri, 9:00 a.m. to 4:00 p.m.</p>
 
-    <!-- Live status about today's window -->
     <div id="status" class="status" role="status" aria-live="polite" style="display:none;"></div>
 
     <form id="loginForm" novalidate>
@@ -73,7 +72,7 @@
   </div>
 
   <script>
-    // --- Constants: match backend rules exactly (ET) ---
+    // Constants: match backend rules in ET
     const ET_TZ = "America/New_York";
     const HARD_DENY_EARLY_MIN = 7 * 60 + 30; // 7:30 a.m. hard deny before this for Basic
     const EARLY_END_MIN       = 8 * 60 + 50; // 8:50 a.m. end of early slip window
@@ -118,12 +117,12 @@
       return { window: "closed", message: "Access has ended for today", details: "Basic ends at 4:00 p.m. ET. Extended ends at 5:30 p.m. ET.", extendEnabled: false, allowSubmit: false };
     }
 
-    // Read Omada query params (with common fallbacks)
+    // Helpers for query params
     const qs = new URLSearchParams(location.search);
     const get = (k) => qs.get(k) || '';
     const first = (...names) => { for (const n of names) { const v = get(n); if (v) return v; } return ''; };
 
-    // Normalize redirect targets so we avoid captive-portal probe URLs that break Omada/CF
+    // Normalize redirect targets to avoid captive test URLs that confuse Omada or Cloudflare
     function normalizeRedirect(url) {
       if (!url) return 'http://neverssl.com';
       try { url = decodeURIComponent(url); } catch {}
@@ -135,12 +134,13 @@
 
     const debugParam = (get('debug') || '').toLowerCase().trim();
 
+    // Capture parameters with safer fallbacks
     const params = {
       clientMac: first('clientMac', 'client_id'),
       apMac: first('apMac', 'gatewayMac'),
       ssidName: first('ssidName', 'ssid'),
-      radioId: first('radioId', 'radio'),
-      site: get('site'),
+      radioId: first('radioId', 'radio'), // keep as string
+      site: first('site', 'siteId'),
       redirectUrl: normalizeRedirect(get('redirectUrl') || 'http://neverssl.com')
     };
 
@@ -152,7 +152,7 @@
     document.getElementById('site').value = params.site;
     document.getElementById('redirectUrl').value = params.redirectUrl;
 
-    // Display current window status + gate Extend behavior
+    // UI elements
     const statusDiv = document.getElementById('status');
     const extendBox = document.getElementById('extend');
     const extendLabel = document.getElementById('extendLabel');
@@ -229,14 +229,14 @@
         clientMac: params.clientMac,
         apMac: params.apMac,
         ssidName: params.ssidName,
-        radioId: params.radioId ? Number(params.radioId) : undefined,
+        radioId: params.radioId, // keep as string
         site: params.site,
         redirectUrl: params.redirectUrl,
         extend: extendBox.checked
       };
 
       const headers = { 'Content-Type': 'application/json' };
-      if (debugParam) headers['X-Debug-Probe'] = debugParam; // <-- forward debug to API
+      if (debugParam) headers['X-Debug-Probe'] = debugParam;
 
       try {
         const res = await fetch('/api/authorize' + (debugParam ? `?debug=${encodeURIComponent(debugParam)}` : ''), {
@@ -250,7 +250,12 @@
 
         if (debugParam) {
           debugDetails.style.display = 'block';
-          debugOut.textContent = JSON.stringify(data, null, 2);
+          debugOut.textContent = JSON.stringify({
+            pageParams: params,
+            payloadSent: payload,
+            responseStatus: res.status,
+            responseBody: data || txt
+          }, null, 2);
         }
 
         if (res.ok && data.ok && data.redirectUrl) {
@@ -261,6 +266,10 @@
         errorDiv.textContent = (data && (data.error || data.message)) ? (data.error || data.message) : 'Authorize failed. Try again.';
       } catch (err) {
         errorDiv.textContent = 'Network error. Try again.';
+        if (debugParam) {
+          debugDetails.style.display = 'block';
+          debugOut.textContent = JSON.stringify({ pageParams: params, error: String(err) }, null, 2);
+        }
       } finally {
         submitBtn.disabled = false;
         submitBtn.textContent = 'Continue';
