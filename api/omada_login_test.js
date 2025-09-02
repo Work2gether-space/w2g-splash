@@ -1,6 +1,6 @@
 // api/omada_login_test.js
 // Verifies External Portal flow using the shared client:
-// operator login -> CSRF token -> /api/v2/hotspot/auth -> loginStatus
+// operator login -> CSRF token -> extPortal/auth (with variants) -> loginStatus
 
 const { hotspotLogin } = require("../lib/omada_hotspot_client");
 
@@ -21,6 +21,14 @@ function readBody(req) {
   });
 }
 
+function pick(obj, ...keys) {
+  for (const k of keys) {
+    const v = obj?.[k];
+    if (v !== undefined && v !== null && String(v).trim() !== "") return String(v).trim();
+  }
+  return "";
+}
+
 module.exports = async (req, res) => {
   if (req.method !== "POST") {
     return json(res, 405, { ok: false, error: "Method not allowed. Use POST." });
@@ -28,20 +36,28 @@ module.exports = async (req, res) => {
 
   const body = await readBody(req);
 
-  const site = body.site || "688c13adee75005c5bb411bd";
-  const clientMac = body.clientMac || "C8-5E-A9-EE-D9-46";
-  const apMac = body.apMac || "30-68-93-E9-96-AE";
-  const ssidName = body.ssidName || "W2G_Basic";
-  const radioId = body.radioId ?? 0;
+  // Accept common fallbacks and keep radioId as string
+  const site    = pick(body, "site", "siteId") || "688c13adee75005c5bb411bd";
+  const clientMac = pick(body, "clientMac") || "C8-5E-A9-EE-D9-46";
+  const apMac     = pick(body, "apMac") || "30-68-93-E9-96-AE";
+  const ssidName  = pick(body, "ssidName", "ssid") || "W2G_Basic";
+  const radioId   = pick(body, "radioId", "radio") || "1"; // keep as string
 
   try {
     const result = await hotspotLogin({ site, clientMac, apMac, ssidName, radioId });
-    const ok = result?.auth?.data?.errorCode === 0;
+
+    // With the new client, success is when a variant was chosen and errorCode === 0
+    const ok = Boolean(result?.chosen && Number(result.chosen?.data?.errorCode) === 0);
+
     return json(res, 200, {
       ok,
       mode: "external-portal-auth",
       input: { site, clientMac, apMac, ssidName, radioId },
-      result,
+      // Expose concise probe info
+      chosen: result?.chosen || null,
+      attempts: result?.authAttempts || [],
+      operatorLogin: result?.operatorLogin || null,
+      status: result?.status || null
     });
   } catch (err) {
     return json(res, 200, {
