@@ -1,7 +1,11 @@
 // api/authorize.js
-// Build: 2025-09-04-3.5e-cloudflared
-// Purpose: External Portal allow flow for W2G_Basic, using Cloudflared tunnel.
-// Change: Default OMADA_BASE now points at the tunnel host https://omada-direct.work2gether.space
+// Build: 2025-09-04-ext-portal-CSRF-hardened
+// Purpose: If ssidName === "W2G_Basic" (External Portal), call extPortal/auth with robust variants.
+// Notes:
+// - Warm both /portal and /hotspot/login
+// - After operator login, ensure CSRF cookies exist if controller didn't set them
+// - Send BOTH CSRF headers on auth (Csrf-Token + X-Csrf-Token)
+// - Include token in POST body and GET fallback too
 
 export default async function handler(req, res) {
   const rid = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
@@ -75,6 +79,14 @@ export default async function handler(req, res) {
     return [...m.values()];
   }
 
+  function ensureCsrfCookies(jar = [], token) {
+    if (!token) return jar;
+    const want = ["portal_csrf", "csrf-token", "x-csrf-token"];
+    const have = new Set((jar || []).map(c => c.split("=")[0].trim().toLowerCase()));
+    const add = want.filter(n => !have.has(n)).map(n => `${n}=${token}`);
+    return mergeCookies(jar, add);
+  }
+
   async function fWithCookies(url, opts = {}, jar = []) {
     const headers = new Headers(opts.headers || {});
     if (jar.length) headers.set("Cookie", jar.join("; "));
@@ -85,6 +97,7 @@ export default async function handler(req, res) {
     headers.set("Cache-Control", "no-cache");
     if (!headers.has("Accept-Language")) headers.set("Accept-Language", "en-US,en;q=0.9");
     if (!headers.has("Origin")) headers.set("Origin", OMADA_BASE);
+    // IMPORTANT: do not overwrite Referer if caller provided it
     if (!headers.has("Referer")) headers.set("Referer", `${OMADA_BASE}/${CTRL}/portal`);
 
     const resp = await fetch(url, {
@@ -96,6 +109,16 @@ export default async function handler(req, res) {
 
     const set = parseSetCookie(resp.headers.get("set-cookie"));
     return { resp, jar: mergeCookies(jar, set) };
+  }
+
+  async function warmPortal(jar = []) {
+    const { resp, jar: j } = await fWithCookies(
+      `${OMADA_BASE}/${CTRL}/portal?_=${Date.now()}`,
+      { method: "GET", headers: { Referer: `${OMADA_BASE}/${CTRL}/portal` } },
+      jar
+    );
+    await resp.text().catch(() => {});
+    return { status: resp.status, jar: j };
   }
 
   async function warmHotspot(jar = []) {
@@ -122,7 +145,10 @@ export default async function handler(req, res) {
     try { const j = JSON.parse(text); bodyToken = j?.result?.token || j?.token || null; } catch {}
     const hdrToken = resp.headers.get("csrf-token") || resp.headers.get("x-csrf-token") || null;
     const token = bodyToken || hdrToken || null;
-    return { status: resp.status, token, raw: text, jar: j2 };
+
+    // seed CSRF cookies if controller didn't set them
+    const j3 = ensureCsrfCookies(j2, token);
+    return { status: resp.status, token, raw: text, jar: j3 };
   }
 
   // ---------- input ----------
@@ -135,13 +161,14 @@ export default async function handler(req, res) {
       ok: false,
       error: "This build only patches External-Portal path for W2G_Basic. SSID is not W2G_Basic.",
       ssidName,
+      omadaBase: OMADA_BASE
     });
   }
 
   const cmIn = pick(body, "clientMac");
   const amIn = pick(body, "apMac", "gatewayMac");
   const site = pick(body, "site", "siteId");
-  const radioId = pick(body, "radioId", "radio") || "1";
+  const radioId = pick(body, "radioId", "radio") || "1"; // keep as string
   const redirectUrl = (() => {
     const r = pick(body, "redirectUrl") || "http://neverssl.com";
     try {
@@ -152,7 +179,7 @@ export default async function handler(req, res) {
   })();
 
   if (!cmIn) {
-    return res.status(400).json({ ok: false, error: "Missing clientMac" });
+    return res.status(400).json({ ok: false, error: "Missing clientMac", omadaBase: OMADA_BASE });
   }
 
   // Build variants
@@ -166,11 +193,12 @@ export default async function handler(req, res) {
     { path: "/api/v2/portal/extPortal/auth",  referer: "/portal"        },
     { path: "/api/v2/extPortal/auth",         referer: "/portal"        },
   ];
+  // we will always send both CSRF header names; keep array only for record-keeping
   const csrfNames = ["Csrf-Token", "X-Csrf-Token"];
   const bodies = [
     { kind: "json_full", ctype: "application/json" },
     { kind: "form_full", ctype: "application/x-www-form-urlencoded" },
-    { kind: "get_fallback", ctype: null },
+    { kind: "get_fallback", ctype: null }
   ];
 
   const buildBodyObj = ({ clientMac, apMac }) => {
@@ -182,9 +210,10 @@ export default async function handler(req, res) {
 
   // ---------- main flow ----------
   try {
-    // 0) warm
+    // 0) warm /portal and /hotspot
     let jar = [];
-    const w = await warmHotspot(jar); jar = w.jar;
+    const wp = await warmPortal(jar); jar = wp.jar;
+    const w  = await warmHotspot(jar); jar = w.jar;
 
     // 1) operator login
     const op = await operatorLogin(jar); jar = op.jar;
@@ -198,15 +227,17 @@ export default async function handler(req, res) {
       for (const m of macVariants) {
         for (const bdef of bodies) {
           if (bdef.kind === "get_fallback") {
+            // GET fallback with query params, include token in query and headers
             const q = new URLSearchParams();
             const b = buildBodyObj(m);
             Object.entries(b).forEach(([k, v]) => q.set(k, String(v)));
+            if (token) q.set("token", token);
             const url = `${OMADA_BASE}/${CTRL}${p.path}?${q.toString()}&_=${Date.now()}`;
             const headers = {
               "X-Requested-With": "XMLHttpRequest",
               Referer: `${OMADA_BASE}/${CTRL}${p.referer}`,
+              ...(token ? { "Csrf-Token": token, "X-Csrf-Token": token } : {}),
             };
-            if (token) headers["Csrf-Token"] = token;
 
             const r = await fWithCookies(url, { method: "GET", headers }, jar);
             const text = await r.resp.text().catch(() => "");
@@ -216,10 +247,10 @@ export default async function handler(req, res) {
               referer: p.referer,
               macVariant: m.name,
               bodyKind: bdef.kind,
-              csrfHeader: "Csrf-Token",
+              csrfHeader: "both",
               http: r.resp.status,
               data,
-              posted: b,
+              posted: b
             };
             attempts.push(rec);
             jar = r.jar;
@@ -227,49 +258,47 @@ export default async function handler(req, res) {
             continue;
           }
 
-          for (const csrfName of csrfNames) {
-            const url = `${OMADA_BASE}/${CTRL}${p.path}?_=${Date.now()}`;
-            const headers = {
-              "Content-Type": bdef.ctype,
-              "X-Requested-With": "XMLHttpRequest",
-              Referer: `${OMADA_BASE}/${CTRL}${p.referer}`,
-            };
-            if (token) headers[csrfName] = token;
+          // POST (json or form) — include token in headers AND body
+          const url = `${OMADA_BASE}/${CTRL}${p.path}?_=${Date.now()}`;
+          const headers = {
+            "Content-Type": bdef.ctype,
+            "X-Requested-With": "XMLHttpRequest",
+            Referer: `${OMADA_BASE}/${CTRL}${p.referer}`,
+            ...(token ? { "Csrf-Token": token, "X-Csrf-Token": token } : {}),
+          };
 
-            let bodyPayload;
-            let bodySentPreview;
-            if (bdef.kind === "json_full") {
-              const obj = buildBodyObj(m);
-              bodyPayload = JSON.stringify(obj);
-              bodySentPreview = obj;
-            } else {
-              const form = new URLSearchParams();
-              const obj = buildBodyObj(m);
-              Object.entries(obj).forEach(([k, v]) => form.set(k, String(v)));
-              bodyPayload = form.toString();
-              bodySentPreview = Object.fromEntries(new URLSearchParams(bodyPayload).entries());
-            }
+          let bodyPayload;
+          let bodySentPreview;
+          const objWithToken = { ...buildBodyObj(m), ...(token ? { token } : {}) };
 
-            const r = await fWithCookies(url, { method: "POST", headers, body: bodyPayload }, jar);
-            const text = await r.resp.text().catch(() => "");
-            let data; try { data = JSON.parse(text); } catch { data = { errorCode: -1, msg: "Non-JSON", raw: text }; }
-
-            const rec = {
-              path: p.path,
-              referer: p.referer,
-              macVariant: m.name,
-              bodyKind: bdef.kind,
-              csrfHeader: csrfName,
-              http: r.resp.status,
-              data,
-              posted: bodySentPreview,
-            };
-            attempts.push(rec);
-            jar = r.jar;
-
-            if (Number(data?.errorCode) === 0 || r.resp.status === 302) { chosen = rec; break; }
+          if (bdef.kind === "json_full") {
+            bodyPayload = JSON.stringify(objWithToken);
+            bodySentPreview = objWithToken;
+          } else {
+            const form = new URLSearchParams();
+            Object.entries(objWithToken).forEach(([k, v]) => form.set(k, String(v)));
+            bodyPayload = form.toString();
+            bodySentPreview = Object.fromEntries(new URLSearchParams(bodyPayload).entries());
           }
-          if (chosen) break;
+
+          const r = await fWithCookies(url, { method: "POST", headers, body: bodyPayload }, jar);
+          const text = await r.resp.text().catch(() => "");
+          let data; try { data = JSON.parse(text); } catch { data = { errorCode: -1, msg: "Non-JSON", raw: text }; }
+
+          const rec = {
+            path: p.path,
+            referer: p.referer,
+            macVariant: m.name,
+            bodyKind: bdef.kind,
+            csrfHeader: "both",
+            http: r.resp.status,
+            data,
+            posted: bodySentPreview
+          };
+          attempts.push(rec);
+          jar = r.jar;
+
+          if (Number(data?.errorCode) === 0 || r.resp.status === 302) { chosen = rec; break; }
         }
         if (chosen) break;
       }
@@ -282,17 +311,21 @@ export default async function handler(req, res) {
         error: "External portal allow did not succeed",
         ssidName,
         attempts,
-        omadaBase: OMADA_BASE,
+        omadaBase: OMADA_BASE
       });
     }
 
-    // 3) optional loginStatus echo
+    // 3) (Optional) echo loginStatus (do not gate success on this)
     const statusUrl = `${OMADA_BASE}/${CTRL}/api/v2/hotspot/loginStatus?_=${Date.now()}`;
-    const rStatus = await fWithCookies(statusUrl, { method: "GET", headers: { Referer: `${OMADA_BASE}/${CTRL}/hotspot/login` } }, jar);
+    const rStatus = await fWithCookies(
+      statusUrl,
+      { method: "GET", headers: { Referer: `${OMADA_BASE}/${CTRL}/hotspot/login`, ...(token ? { "Csrf-Token": token, "X-Csrf-Token": token } : {}) } },
+      jar
+    );
     const statusText = await rStatus.resp.text().catch(() => "");
     let statusJson = null; try { statusJson = JSON.parse(statusText); } catch {}
 
-    // 4) success
+    // 4) success to splash — include redirectUrl so the page can navigate
     return res.status(200).json({
       ok: true,
       mode: "external-portal-allow",
@@ -307,10 +340,10 @@ export default async function handler(req, res) {
         chosen,
         loginStatusEcho: { http: rStatus.resp.status, json: statusJson || null },
       },
-      message: "External portal allow submitted; client should be released by controller.",
+      message: "External portal allow submitted; client should be released by controller."
     });
   } catch (e) {
     err("authorize error:", e?.stack || e);
-    return res.status(502).json({ ok: false, error: String(e?.message || e) });
+    return res.status(502).json({ ok: false, error: String(e?.message || e), omadaBase: OMADA_BASE });
   }
 }
