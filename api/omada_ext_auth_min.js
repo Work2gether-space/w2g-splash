@@ -1,8 +1,10 @@
 // api/omada_ext_auth_min.js
+// Build: 2025-09-04-3.5e-cloudflared
 // EXTREMELY MINIMAL extPortal/auth probe with small variants
 // Tries: path variants, CSRF header variants, MAC formats, form vs JSON payloads
+// Change: OMADA_BASE now defaults to the Cloudflared tunnel host.
 
-const OMADA_BASE = (process.env.OMADA_BASE || "https://omada.work2gether.space").replace(/\/+$/, "");
+const OMADA_BASE = String(process.env.OMADA_BASE || "https://omada-direct.work2gether.space").replace(/\/+$/, "");
 const CTRL = process.env.OMADA_CONTROLLER_ID || "fc2b25d44a950a6357313da0afb4c14a";
 const OP_USER = process.env.OMADA_OPERATOR_USER;
 const OP_PASS = process.env.OMADA_OPERATOR_PASS;
@@ -38,7 +40,7 @@ function parseSetCookie(h) {
 function mergeCookies(a, b) {
   const m = new Map();
   for (const c of [...a, ...b]) {
-    const [n, ...r] = c.split("=");
+    const [n, ...r] = String(c).split("=");
     m.set(n.trim(), `${n.trim()}=${r.join("=")}`);
   }
   return [...m.values()];
@@ -46,7 +48,7 @@ function mergeCookies(a, b) {
 async function fWithCookies(url, opts = {}, jar = []) {
   const headers = new Headers(opts.headers || {});
   if (jar.length) headers.set("Cookie", jar.join("; "));
-  if (!headers.has("User-Agent")) headers.set("User-Agent", "w2g-ext-auth-min/2025-09-02");
+  if (!headers.has("User-Agent")) headers.set("User-Agent", "w2g-ext-auth-min/2025-09-04");
   if (!headers.has("Accept")) headers.set("Accept", "application/json,text/html;q=0.9,*/*;q=0.1");
   headers.set("Connection", "close");
   headers.set("Pragma", "no-cache");
@@ -129,9 +131,15 @@ function buildJsonFull({ clientMac, apMac, ssidName, radioId, site }) {
   return JSON.stringify(obj);
 }
 
-module.exports = async (req, res) => {
+export default async (req, res) => {
   if (req.method !== "POST") return send(res, 405, { ok: false, error: "Use POST." });
-  if (!OP_USER || !OP_PASS) return send(res, 500, { ok: false, error: "Missing OMADA_OPERATOR_USER or OMADA_OPERATOR_PASS" });
+  if (!OP_USER || !OP_PASS) {
+    return send(res, 500, {
+      ok: false,
+      error: "Missing OMADA_OPERATOR_USER or OMADA_OPERATOR_PASS",
+      omadaBase: OMADA_BASE,
+    });
+  }
 
   const b = await readBody(req);
 
@@ -233,7 +241,7 @@ module.exports = async (req, res) => {
             attempts.push(rec);
             jar = r.jar;
 
-            if (Number(data?.errorCode) === 0) {
+            if (Number(data?.errorCode) === 0 || r.resp.status === 302) {
               chosen = rec;
               break;
             }
@@ -247,6 +255,7 @@ module.exports = async (req, res) => {
 
     return send(res, 200, {
       ok: Boolean(chosen),
+      omadaBase: OMADA_BASE,
       input: {
         clientMac: clientMacIn,
         apMac: apMacIn || "",
@@ -259,6 +268,6 @@ module.exports = async (req, res) => {
       attempts
     });
   } catch (e) {
-    return send(res, 200, { ok: false, error: e?.message || String(e) });
+    return send(res, 200, { ok: false, omadaBase: OMADA_BASE, error: e?.message || String(e) });
   }
 };
