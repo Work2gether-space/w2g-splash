@@ -1,22 +1,23 @@
 // api/omada_probe.js  Vercel Node runtime, ESM style
+// Build: 2025-09-04-3.5e-cloudflared
 // Purpose: run the hotspot operator login flow from Vercel and report controller behavior.
+// Change: OMADA_BASE now defaults to the Cloudflared tunnel host if the env var is not set.
 
 export default async function handler(req, res) {
   const rid = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
   const log = (...a) => console.log(`[omada_probe][${rid}]`, ...a);
   const err = (...a) => console.error(`[omada_probe][${rid}]`, ...a);
 
-  const {
-    OMADA_BASE,
-    OMADA_CONTROLLER_ID,
-    OMADA_OPERATOR_USER,
-    OMADA_OPERATOR_PASS,
-  } = process.env;
+  // ---------- env ----------
+  const OMADA_BASE = String(process.env.OMADA_BASE || "https://omada-direct.work2gether.space").replace(/\/+$/, "");
+  const OMADA_CONTROLLER_ID = process.env.OMADA_CONTROLLER_ID || "fc2b25d44a950a6357313da0afb4c14a";
+  const OMADA_OPERATOR_USER = process.env.OMADA_OPERATOR_USER;
+  const OMADA_OPERATOR_PASS = process.env.OMADA_OPERATOR_PASS;
 
-  if (!OMADA_BASE || !OMADA_CONTROLLER_ID || !OMADA_OPERATOR_USER || !OMADA_OPERATOR_PASS) {
+  if (!OMADA_OPERATOR_USER || !OMADA_OPERATOR_PASS) {
     return res.status(500).json({
       ok: false,
-      error: "Missing required Omada env vars",
+      error: "Missing required Omada operator credentials",
       present: {
         OMADA_BASE: !!OMADA_BASE,
         OMADA_CONTROLLER_ID: !!OMADA_CONTROLLER_ID,
@@ -26,7 +27,7 @@ export default async function handler(req, res) {
     });
   }
 
-  const base = String(OMADA_BASE).replace(/\/+$/, "");
+  const base = OMADA_BASE;
   const CTRL = OMADA_CONTROLLER_ID;
   const URLS = {
     portal: `${base}/${CTRL}/portal`,
@@ -34,7 +35,7 @@ export default async function handler(req, res) {
     loginStd: `${base}/${CTRL}/api/v2/hotspot/login`,
     loginAlt: `${base}/${CTRL}/api/v2/hotspot/extPortal/login`,
     statusWith: (t) => `${base}/${CTRL}/api/v2/hotspot/loginStatus?token=${encodeURIComponent(t)}&_=${Date.now()}`,
-    statusNoToken: `${base}/${CTRL}/api/v2/hotspot/loginStatus?_=${Date.now()}`
+    statusNoToken: `${base}/${CTRL}/api/v2/hotspot/loginStatus?_=${Date.now()}`,
   };
 
   const axios = (await import("axios")).default;
@@ -63,24 +64,26 @@ export default async function handler(req, res) {
   // cookie helpers
   const parseSetCookie = (h) => {
     const arr = Array.isArray(h) ? h : (h ? [h] : []);
-    return arr.map(s => String(s).split(";")[0].trim()).filter(Boolean);
+    return arr.map((s) => String(s).split(";")[0].trim()).filter(Boolean);
   };
   const mergeCookieStrings = (a, b) => {
     const map = new Map();
-    [...a, ...b].forEach(kv => {
+    [...a, ...b].forEach((kv) => {
       const [n, ...rest] = kv.split("=");
       map.set(n.trim(), `${n.trim()}=${rest.join("=")}`);
     });
     return [...map.values()];
   };
-  const cookieHeaderValue = (cookies) => cookies.length ? cookies.join("; ") : "";
+  const cookieHeaderValue = (cookies) => (cookies.length ? cookies.join("; ") : "");
 
-  const hkeys = (h = {}) => Object.keys(h || {}).map(k => k.toLowerCase()).sort();
+  const hkeys = (h = {}) => Object.keys(h || {}).map((k) => k.toLowerCase()).sort();
   const bodySample = (data) => {
     try {
       const s = typeof data === "string" ? data : JSON.stringify(data);
       return s.length > 400 ? s.slice(0, 400) + "…" : s;
-    } catch { return "<unserializable>"; }
+    } catch {
+      return "<unserializable>";
+    }
   };
   const findTokenIn = (resp) => {
     const data = resp?.data;
@@ -102,7 +105,7 @@ export default async function handler(req, res) {
     base,
     controllerId: CTRL,
     steps: [],
-    tokenPresent: false
+    tokenPresent: false,
   };
 
   try {
@@ -198,11 +201,7 @@ export default async function handler(req, res) {
       });
     }
 
-    const token =
-      tokenPieces.bodyToken ||
-      tokenPieces.hdrToken ||
-      tokenPieces.cookieToken ||
-      null;
+    const token = tokenPieces.bodyToken || tokenPieces.hdrToken || tokenPieces.cookieToken || null;
 
     // STEP E: status probes
     const statusAttempts = [];
@@ -253,7 +252,7 @@ export default async function handler(req, res) {
 
     out.steps.push({
       step: "login_status_matrix",
-      attempts: statusAttempts
+      attempts: statusAttempts,
     });
 
     out.ok = Boolean(token);
@@ -266,7 +265,7 @@ export default async function handler(req, res) {
       ok: false,
       error: String(e?.message || e),
       base,
-      controllerId: CTRL
+      controllerId: CTRL,
     });
   }
 }
