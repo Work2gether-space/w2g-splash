@@ -7,12 +7,28 @@ const { URL } = require('url');
 function safeRequire(p) {
   try { return require(p); } catch { return null; }
 }
+function asHandler(mod) {
+  if (!mod) return null;
+  // support: CJS export (fn), CJS {handler}, ESM default export, ESM named export
+  if (typeof mod === 'function') return mod;
+  if (typeof mod.default === 'function') return mod.default;
+  if (typeof mod.handler === 'function') return mod.handler;
+  return null;
+}
 
-const authorize = safeRequire('./authorize');
-const submitEmail = safeRequire('./submit_email');
+// Load handlers (add any others you want to test locally)
+const authorize        = asHandler(safeRequire('./api/authorize'));
+const submitEmail      = asHandler(safeRequire('./api/submit_email'));
+const omadaProbe       = asHandler(safeRequire('./api/omada_probe'));
+const omadaLoginTest   = asHandler(safeRequire('./api/omada_login_test'));
+const omadaAuthProbe   = asHandler(safeRequire('./api/omada_auth_probe'));
+const omadaExtAuthMin  = asHandler(safeRequire('./api/omada_ext_auth_min'));
 
 const PORT = Number(process.env.PORT || 3000);
-const HOST = process.env.HOST || '0.0.0.0');
+const HOST = process.env.HOST || '0.0.0.0';
+
+const OMADA_BASE = String(process.env.OMADA_BASE || 'https://omada-direct.work2gether.space').replace(/\/+$/, '');
+const CTRL = process.env.OMADA_CONTROLLER_ID || 'fc2b25d44a950a6357313da0afb4c14a';
 
 function setCors(res) {
   try {
@@ -25,17 +41,16 @@ function setCors(res) {
 function sendJson(res, code, obj) {
   setCors(res);
   res.statusCode = code;
-  res.setHeader('Content-Type', 'application/json');
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
   res.end(JSON.stringify(obj));
 }
 
 function readBody(req) {
   return new Promise((resolve) => {
-    let chunks = [];
+    const chunks = [];
     req.on('data', (c) => chunks.push(c));
     req.on('end', () => {
-      const buf = Buffer.concat(chunks);
-      const text = buf.toString('utf8');
+      const text = Buffer.concat(chunks).toString('utf8');
       resolve(text);
     });
     req.on('error', () => resolve(''));
@@ -57,9 +72,19 @@ const server = http.createServer(async (req, res) => {
   if (pathname === '/health' || pathname === '/') {
     return sendJson(res, 200, {
       ok: true,
+      env: {
+        OMADA_BASE,
+        OMADA_CONTROLLER_ID: CTRL,
+        OMADA_OPERATOR_USER: Boolean(process.env.OMADA_OPERATOR_USER),
+        OMADA_OPERATOR_PASS: Boolean(process.env.OMADA_OPERATOR_PASS),
+      },
       routes: {
-        authorize: Boolean(authorize),
-        submit_email: Boolean(submitEmail),
+        authorize:        Boolean(authorize),
+        submit_email:     Boolean(submitEmail),
+        omada_probe:      Boolean(omadaProbe),
+        omada_login_test: Boolean(omadaLoginTest),
+        omada_auth_probe: Boolean(omadaAuthProbe),
+        omada_ext_auth_min:Boolean(omadaExtAuthMin),
       }
     });
   }
@@ -67,7 +92,6 @@ const server = http.createServer(async (req, res) => {
   // For POST routes, read and attach body like Vercel would
   if (req.method === 'POST') {
     const raw = await readBody(req);
-    // Try to parse JSON, else leave as raw string
     try { req.body = JSON.parse(raw || '{}'); }
     catch { req.body = raw || ''; }
   }
@@ -81,6 +105,27 @@ const server = http.createServer(async (req, res) => {
     if (pathname === '/api/submit_email') {
       if (!submitEmail) return sendJson(res, 500, { ok: false, error: 'submit_email handler missing' });
       return submitEmail(req, res);
+    }
+
+    // Optional local endpoints for Omada debugging
+    if (pathname === '/api/omada_probe') {
+      if (!omadaProbe) return sendJson(res, 500, { ok: false, error: 'omada_probe handler missing' });
+      return omadaProbe(req, res);
+    }
+
+    if (pathname === '/api/omada_login_test') {
+      if (!omadaLoginTest) return sendJson(res, 500, { ok: false, error: 'omada_login_test handler missing' });
+      return omadaLoginTest(req, res);
+    }
+
+    if (pathname === '/api/omada_auth_probe') {
+      if (!omadaAuthProbe) return sendJson(res, 500, { ok: false, error: 'omada_auth_probe handler missing' });
+      return omadaAuthProbe(req, res);
+    }
+
+    if (pathname === '/api/omada_ext_auth_min') {
+      if (!omadaExtAuthMin) return sendJson(res, 500, { ok: false, error: 'omada_ext_auth_min handler missing' });
+      return omadaExtAuthMin(req, res);
     }
 
     return sendJson(res, 404, { ok: false, error: 'Not found' });
